@@ -1,6 +1,6 @@
 /*/////////////////////////////////////////////////////////////////////////////
 /// @summary Provides an interface to the filesystem for performing I/O ops.
-/// The implementation files are platform-specific, but assumes that reads and
+/// The implementation files are platform-specific, but assume that reads and
 /// writes of aligned 32-bit values are atomic on the platform.
 ///////////////////////////////////////////////////////////////////////////80*/
 
@@ -32,27 +32,52 @@
 #define IO_WAIT_FOREVER    0xFFFFFFFFU
 #endif
 
+/// @summary A special identifier meaning 'all active jobs'.
+#ifndef IO_ALL_ACTIVE
+#define IO_ALL_ACTIVE      0xFFFFFFFFU
+#endif
+
 /// @summary Define the maximum number of ranges that can be specified
 /// for reading chunks of a file.
 #ifndef IO_MAX_RANGES
 #define IO_MAX_RANGES      64
 #endif
 
+/// @summary Define the maximum number of files that can possibly be active in 
+/// an io_rdq_t at any given time.
+#define IO_MAX_FILES       64
+
 /*////////////////////////////
 //   Forward Declarations   //
 ////////////////////////////*/
-struct io_rdq_t;
-struct io_rdlist_t;
+struct io_rdq_t;                   /// Manages concurrent read operations.
+struct io_rdop_t;                  /// A single successful read operation.
+struct io_rdq_job_t;               /// Input parameters for a file read job.
+struct io_rdq_result_t;            /// A completed file read job.
+
+template <typename T>
+struct io_srsw_fifo_t;             /// A SRSW-safe concurrent queue.
+
+template <typename T>
+struct io_srsw_waitable_fifo_t;    /// A SRSW-safe concurrent waitable queue.
+
+typedef io_srsw_fifo_t<void*>                    io_returnq_t; /// SRSW FIFO for buffer returns.
+typedef io_srsw_fifo_t<uint32_t>                 io_rdstopq_t; /// SRSW FIFO for cancelling active jobs.
+typedef io_srsw_waitable_fifo_t<io_rdop_t>       io_rdopq_t;   /// SRSW FIFO for completed reads.
+typedef io_srsw_waitable_fifo_t<io_rdq_job_t>    io_rdpendq_t; /// SRSW FIFO for submitting jobs.
+typedef io_srsw_waitable_fifo_t<io_rdq_result_t> io_rddoneq_t; /// SRSW FIFO for completed jobs.
 
 /*//////////////////
 //   Data Types   //
 //////////////////*/
 /// @summary Status reported to the caller with a completed I/O request.
-enum io_status_e
+enum io_job_status_e
 {
-    IO_STATUS_NONE  = (0 << 0), /// No status is being reported.
-    IO_STATUS_EOF   = (1 << 0), /// End-of-file was reached, and the file is closed.
-    IO_STATUS_ERROR = (1 << 1)  /// An error occurred, and the file is closed.
+    IO_STATUS_UNKNOWN   = (0<<0),  /// The job status is unknown.
+    IO_STATUS_SUCCESS   = (1<<0),  /// The job completed successfully, and the file is closed.
+    IO_STATUS_EOF       = (1<<1),  /// End-of-file was reached, and the file is closed.
+    IO_STATUS_ERROR     = (1<<2),  /// An error occurred, and the file is closed.
+    IO_STATUS_CANCELLED = (1<<3)   /// The job was cancelled, and the file is closed.
 };
 
 /// @summary Represents a growable list of UTF-8 file paths. Designed to support
@@ -60,30 +85,16 @@ enum io_status_e
 /// store byte offsets instead of pointers within data buffers.
 struct io_file_list_t
 {
-    uint32_t     PathCapacity;  /// The current capacity, in paths.
-    uint32_t     PathCount;     /// The number of paths items currently in the list.
-    uint32_t     BlobCapacity;  /// The current capacity of PathData, in bytes.
-    uint32_t     BlobCount;     /// The number of bytes used in PathData.
-    uint32_t     MaxPathBytes;  /// The maximum length of any path in the list, in bytes.
-    uint32_t     TotalBytes;    /// The total number of bytes allocated.
-    uint32_t    *HashList;      /// Hash values calculated for the paths in the list.
-    uint32_t    *SizeList;      /// Length values (not including the zero byte) for each path.
-    uint32_t    *PathOffset;    /// Offsets, in bytes, into PathData to the start of each path.
-    char        *PathData;      /// Raw character data. PathList points into this blob.
-};
-
-/// @summary Represents a list of buffers used as the target of read operations.
-/// Each buffer in the list has the same size and alignment.
-struct io_rdbuf_list_t
-{
-    size_t       Alignment;     /// The allocation alignment for buffers in this list.
-    size_t       BuffersTotal;  /// The total number of buffers (free and used).
-    size_t       BuffersUsed;   /// The number of buffers currently in use.
-    void       **BufferAddress; /// Pointers to the start of each buffer.
-    size_t      *BufferAmounts; /// The number of bytes actually used in each buffer.
-    size_t       BufferSize;    /// The size of each buffer, in bytes.
-    size_t       BytesAllocated;/// The total number of bytes allocated.
-    size_t       BytesUsed;     /// The total number of bytes actually in-use.
+    uint32_t      PathCapacity;    /// The current capacity, in paths.
+    uint32_t      PathCount;       /// The number of paths items currently in the list.
+    uint32_t      BlobCapacity;    /// The current capacity of PathData, in bytes.
+    uint32_t      BlobCount;       /// The number of bytes used in PathData.
+    uint32_t      MaxPathBytes;    /// The maximum length of any path in the list, in bytes.
+    uint32_t      TotalBytes;      /// The total number of bytes allocated.
+    uint32_t     *HashList;        /// Hash values calculated for the paths in the list.
+    uint32_t     *SizeList;        /// Length values (not including the zero byte) for each path.
+    uint32_t     *PathOffset;      /// Offsets, in bytes, into PathData to the start of each path.
+    char         *PathData;        /// Raw character data. PathList points into this blob.
 };
 
 /// @summary Defines the data associated with a fixed-size, lookaside queue. 
@@ -95,37 +106,73 @@ struct io_rdbuf_list_t
 /// module, but this structure and its operations are cross-platform.
 struct io_srsw_flq_t
 {
-    uint32_t     PushedCount;   /// Number of push operations performed.
-    uint32_t     PoppedCount;   /// Number of pop operations performed.
-    uint32_t     Capacity;      /// The queue capacity. Always a power-of-two.
+    uint32_t      PushedCount;     /// Number of push operations performed.
+    uint32_t      PoppedCount;     /// Number of pop operations performed.
+    uint32_t      Capacity;        /// The queue capacity. Always a power-of-two.
+};
+
+/// @summary Describes a single portion of a file.
+struct io_range_t
+{
+    uint64_t      Offset;          /// The byte offset of the start of the range.
+    uint64_t      Amount;          /// The size of the range, in bytes.
 };
 
 /// @summary Describes the configuration for an I/O queue.
 struct io_rdq_config_t
 {
-    io_rdlist_t *ReadList;      /// Where to write completed reads.
-    size_t       MaxConcurrent; /// The maximum number of files opened concurrently.
-    size_t       MaxBufferSize; /// The maximum amount of buffer space that can be allocated.
-    size_t       BufferSize;    /// The number of bytes to read in a single operation.
-    bool         AsyncIo;       /// true to use asynchronous I/O operations.
+    io_rdopq_t   *DataQueue;       /// Where to write completed io_rdop_t for processing.
+    io_rdpendq_t *PendingQueue;    /// Where to look for pending file processing jobs.
+    io_rdstopq_t *CancelQueue;     /// Where to look for pending job cancellations.
+    io_rddoneq_t *CompleteQueue;   /// Where to write completed job information.
+    size_t        MaxConcurrent;   /// The maximum number of files opened concurrently.
+    size_t        MaxBufferSize;   /// The maximum amount of buffer space that can be allocated.
+    size_t        MaxReadSize;     /// The maximum number of bytes to read in a single operation.
+    bool          Unbuffered;      /// true to use unbuffered I/O operations.
+    bool          Asynchronous;    /// true to use asynchronous I/O operations.
 };
 
-/// @summary Describes a single portion of a file to be read.
-struct io_range_t
+/// @summary Describes a pending job to be submitted to a read queue.
+struct io_rdq_job_t
 {
-    uint64_t     Offset;        /// The byte offset at which to begin reading.
-    uint64_t     Amount;        /// The number of bytes to read.
+    #define NR    IO_MAX_RANGES
+    uint32_t      JobId;           /// A value identifying this job.
+    char const   *Path;            /// The path of the file to read.
+    uint64_t      EnqueueTime;     /// Nanosecond timestamp. Set to zero.
+    size_t        RangeCount;      /// The number of ranges defined.
+    io_range_t    RangeList[NR];   /// A description of each range to read.
+    #undef NR
 };
 
-/// @summary Describes the result of a read operation.
-struct io_read_t
+/// @summary Describes the results of a job completed by a read queue.
+struct io_rdq_result_t
 {
-    uint64_t     RangeOffset;   /// The byte offset of the start of the current range.
-    uint64_t     FileOffset;    /// The byte offset within the file at which the read started.
-    size_t       Amount;        /// The amount of data available in Buffer, in bytes.
-    void        *Buffer;        /// Pointer to the fiirst available byte.
-    uint32_t     Status;        /// One of io_status_e.
-    uint32_t     Id;            /// The application-defined ID associated with the file.
+    uint32_t      JobId;           /// The job identifier.
+    uint32_t      Status;          /// Combination of io_job_status_e.
+    uint32_t      OSError;         /// Any error code returned by the OS.
+    uint32_t      Reserved1;       /// Reserved for future use.
+    uint64_t      BytesTotal;      /// The total number of bytes in the file.
+    uint64_t      BytesJob;        /// The total number of bytes requested to be read.
+    uint64_t      BytesRead;       /// The total number of bytes actually read.
+    uint64_t      NanosWait;       /// The total number of nanoseconds the job was waiting.
+    uint64_t      NanosRead;       /// The total number of nanoseconds spent doing I/O.
+    uint64_t      NanosTotal;      /// The total number of nanoseconds to process the job.
+};
+
+/// @summary Describes the result of a successful read operation. The read may
+/// be only a partial read; each read operation is at most the number of bytes
+/// specified by the io_rdq_config_t::MaxReadSize field. The data can be queued
+/// for later processing. When processing has completed, you must call:
+/// io_rdq_complete_dp(io_read->ReturnQueue, io_read->DataBuffer).
+/// Instances of io_read_t are placed in the read list identified by the 
+/// io_rdq_config_t::DataQueue field.
+struct io_rdop_t
+{
+    uint32_t      Id;              /// The application-defined ID associated with the file.
+    uint32_t      DataAmount;      /// The maximum number of bytes to read from DataBuffer.
+    void         *DataBuffer;      /// Pointer to the first available byte.
+    io_returnq_t *ReturnQueue;     /// The queue to which the buffer should be returned.
+    uint64_t      FileOffset;      /// The byte offset within the file at which the read started.
 };
 
 /*/////////////////
@@ -230,160 +277,6 @@ IO_C_API(void) io_format_file_list(FILE *fp, io_file_list_t const *list);
 /// @return true if enumeration completed without error.
 IO_C_API(bool) io_enumerate_files(io_file_list_t *dest, char const *path, char const *filter, bool recurse);
 
-/// @summary Creates and initializes a new read buffer list.
-/// @param list The read buffer list to initialize.
-/// @param buffer_align A power-of-two value specifying the desired buffer alignment.
-/// @param buffer_size The usable size of each buffer, in bytes.
-/// @param capacity The number of buffers to pre-allocate.
-/// @return true if the read buffer list was created successfully.
-IO_C_API(bool) io_create_rdbuf_list(io_rdbuf_list_t *list, size_t buffer_align, size_t buffer_size, size_t capacity);
-
-/// @summary Frees resources associated with a read buffer list.
-/// @param list The read buffer list to delete.
-IO_C_API(void) io_delete_rdbuf_list(io_rdbuf_list_t *list);
-
-/// @summary Returns all allocated buffers to the free list.
-/// @param list The read buffer list to flush.
-IO_C_API(void) io_flush_rdbuf_list(io_rdbuf_list_t *list);
-
-/// @summary Retrieves a buffer from a read buffer list. If no buffers are 
-/// currently available, a new buffer is allocated and returned. Note that 
-/// this function is not safe for concurrent access by multiple threads.
-/// @param list The read buffer list servicing the request.
-/// @param out_amount_addr On return, this points to the address storing the 
-/// amount used in the buffer. You may read from and write to this location to
-/// update the amount used in the buffer.
-/// @return A pointer to the buffer, or NULL.
-IO_C_API(void*) io_rdbuf_list_get(io_rdbuf_list_t *list, size_t *&out_amount_addr);
-
-/// @summary Returns a buffer to a read buffer list, making it available for use.
-/// Note that this function is not safe for concurrent access by multiple threads.
-/// @param list The read buffer list that returned the buffer.
-/// @param buffer The buffer returned by io_rdbuf_list_get(list, ...).
-IO_C_API(void) io_rdbuf_list_put(io_rdbuf_list_t *list, void *buffer);
-
-/// @summary Creates a new, empty list for storing completed read operations. 
-/// The list is safe for concurrent access by a single reader and single writer.
-/// @return A pointer to the new read list, or NULL.
-IO_C_API(io_rdlist_t*) io_create_read_list(void);
-
-/// @summary Frees resources associated with a read operation list.
-/// @param rdlist The read list to delete.
-IO_C_API(void) io_delete_read_list(io_rdlist_t *rdlist);
-
-/// @summary Waits for one or more completed read operations to become available.
-/// This function should be called only from the consumer. It does not  guarantee
-/// that read operations have completed, so be sure to check by calling io_read_list_available() 
-/// to get the number that have actually completed.
-/// @param rdlist The read list to wait on.
-/// @param timeout_ms The maximum number of milliseconds to wait.
-/// @return true if at least one completed read operation is available, or false 
-/// if the wait operation timeout interval elapsed or an error occurred.
-IO_C_API(bool) io_wait_read_list(io_rdlist_t *rdlist, uint32_t timeout_ms);
-
-/// @summary Retrieves the number of completed read operations. This function 
-/// should be called only from the processing thread.
-/// @param rdlist The read list to query.
-/// @return The number of completed read operations available to retrieve.
-IO_C_API(size_t) io_read_list_available(io_rdlist_t *rdlist);
-
-/// @summary Retrieves information about a completed read operation. This 
-/// function should be called only from the consumer, and in the case where 
-/// the consumer knows that io_read_list_available(rdlist) > 0.
-/// @param rdlist The read list to query.
-/// @param out_op Information about the completed operation is copied here.
-IO_C_API(void) io_read_list_get(io_rdlist_t *rdlist, io_read_t *out_op);
-
-/// @summary Sets the number of completed read operations to zero. This function
-/// should be called only from the consumer.
-/// @param rdlist The read list to flush.
-IO_C_API(void) io_flush_read_list(io_rdlist_t *rdlist);
-
-/// @summary Appends a completed read operation to a read list. This function 
-/// should be called only by the producer.
-/// @param rdlist The read list to post the I/O operation to.
-/// @param op Information about the completed operation.
-IO_C_API(void) io_read_list_put(io_rdlist_t *rdlist, io_read_t const &op);
-
-/// @summary Create a new concurrent file read queue. The read queue manages 
-/// opening a set of files, reading them sequentially from beginning to end,
-/// placing the read data into a list of data to process, and then closing the
-/// file once all data has been processed. The design allows for maximum overlap
-/// between I/O and processing of the data. The read queue is safe for a single
-/// concurrent producer (calls io_rdq_add(), etc.) and a single consumer that
-/// calls io_[wait|poll]_rdq_io().
-/// @param config Configuration parameters for the queue.
-/// @return A pointer to the initialized queue, or NULL.
-IO_C_API(io_rdq_t*) io_create_rdq(io_rdq_config_t const *config);
-
-/// @summary Delete a concurrent file read queue. All pending I/O operations 
-/// are cancelled, all files are closed, all buffers are deleted, and the 
-/// results list is flushed.
-/// @param rdq The read queue to delete.
-IO_C_API(void) io_delete_rdq(io_rdq_t *rdq);
-
-/// @summary Block the calling thread until a file slot becomes available.
-/// @param rdq The read queue to wait on.
-/// @param timeout_ms The maximum number of milliseconds to wait.
-/// @return true if a file slot became available, or false if the timeout 
-/// interval elapsed or an error occurred.
-IO_C_API(bool) io_wait_rdq_available(io_rdq_t *rdq, uint32_t timeout_ms);
-
-/// @summary Block the calling thread until all active jobs have been completed.
-/// @param rdq The read queue to wait on.
-/// @param timeout_ms The maximum number of milliseconds to wait.
-/// @return true if all active jobs have been completed, or false if the timeout
-/// interval elapsed or an error occurred.
-IO_C_API(bool) io_wait_rdq_empty(io_rdq_t *rdq, uint32_t timeout_ms);
-
-/// @summary Block the calling thread until at least one pending I/O operation
-/// has completed, and schedule any new I/O operations. 
-/// @param rdq The read queue to wait on.
-/// @param timeout_ms The maximum number of milliseconds to wait.
-/// @return true if an I/O operation completed, or false if the timeout interval
-/// elapsed or an error occurred.
-IO_C_API(bool) io_wait_rdq_io(io_rdq_t *rdq, uint32_t timeout_ms);
-
-/// @summary Synchronously poll a read queue to update the state of all pending
-/// I/O operations and schedule any new I/O operations. This lets you schedule
-/// the I/O start and completion within some larger process.
-/// @param rdq The read queue to update.
-IO_C_API(void) io_poll_rdq_io(io_rdq_t *rdq);
-
-/// @summary Queues a single file to be read. The file is opened synchronously 
-/// and the first read operation is scheduled and started.
-/// @param rdq The read queue to manage the operation.
-/// @param path The path of the file to read.
-/// @param id An application-defined identifier associated with the file.
-/// @param range_list A list of offset/size pairs specifying the portions of 
-/// the file to read, or specify NULL to read the entire file from beginning to end.
-/// @param range_count The number of items in range_list. At most IO_MAX_RANGES.
-/// @param out_size On return, stores the total size of the file, in bytes.
-/// @return true if the file was added to the queue.
-IO_C_API(bool) io_rdq_add(io_rdq_t *rdq, char const *path, uint32_t id, io_range_t const *range_list, size_t range_count, uint64_t *out_size);
-
-/// @summary Queries a read queue for the number of available file slots.
-/// @param rdq The read queue to query.
-/// @return The number of available file slots.
-IO_C_API(size_t) io_rdq_available(io_rdq_t *rdq);
-
-/// @summary Cancels all pending I/O operations on a file, and closes the file.
-/// @param rdq The read queue managing the file.
-/// @param id The ID associated with the file to close.
-IO_C_API(void) io_rdq_cancel(io_rdq_t *rdq, uint32_t id);
-
-/// @summary Cancels all pending I/O operations and closes all files.
-/// @param rdq The target read queue.
-IO_C_API(void) io_rdq_cancel_all(io_rdq_t *rdq);
-
-/// @summary Signals the completion of processing on the data returned by a 
-/// read operation, and returns the buffer to the read queue for reuse. This 
-/// function must be called by the processor for every completed read operation.
-/// @param rdq The read queue that reported the read operation.
-/// @param id The unique identifier of the file from which the data was read.
-/// @param buffer The buffer returned as part of the io_read_t.
-IO_C_API(void) io_rdq_complete(io_rdq_t *rdq, uint32_t id, void *buffer);
-
 #ifdef __cplusplus
 }; // extern "C"
 #endif
@@ -425,6 +318,15 @@ static inline uint32_t io_srsw_flq_count(io_srsw_flq_t &srswq)
 static inline bool io_srsw_flq_full(io_srsw_flq_t &srswq)
 {
     return (io_srsw_flq_count(srswq) == srswq.Capacity);
+}
+
+/// @summary Checks whether a SRSW fixed lookaside queue is empty. Check this 
+/// before popping an item from the queue.
+/// @param srswq The queue to query.
+/// @return true if the queue is empty.
+static inline bool io_srsw_flq_empty(io_srsw_flq_t &srswq)
+{
+    return (io_srsw_flq_count(srswq) == 0);
 }
 
 /// @summary Gets the index the next push operation will write to. This must be
