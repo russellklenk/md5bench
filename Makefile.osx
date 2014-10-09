@@ -36,7 +36,7 @@ ${PLATFORM_DEPS}: %.dep: %.cpp ${HEADERS} ${PLATFORM_HDRS} Makefile.osx
 output:: ${TARGET}
 
 clean::
-	rm -f *~ *.o *.dep src/*~ src/*.o src/*.dep ${TARGET} 
+	rm -f *~ *.o *.dep src/*~ src/*.o src/*.dep src/posix/*.o src/posix/*.dep ${TARGET} 
 
 distclean:: clean
 
