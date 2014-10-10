@@ -54,7 +54,7 @@ static uint64_t const SEC_TO_NANOSEC = 1000000000ULL;
 typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
 typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
 typedef BOOL (WINAPI *CancelIoExFn)(HANDLE, OVERLAPPED*);
-typedef BOOL (WINBASEAPI *GetOverlappedResultExFn)(HANDLE, OVERLAPPED*, DWORD*, DWORD, BOOL);
+typedef BOOL (WINAPI *GetOverlappedResultExFn)(HANDLE, OVERLAPPED*, DWORD*, DWORD, BOOL);
 
 static CancelIoExFn                 CancelIoEx_Func                 = NULL;
 static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
@@ -208,7 +208,7 @@ struct io_rdq_file_t
     HANDLE           File;          /// The file handle, or INVALID_FILE_HANDLE.
     void            *TargetBuffer;  /// The target buffer for the current read, or NULL.
     size_t           SectorSize;    /// The physical sector size of the disk, in bytes.
-    size_t           BytesRead;     /// The total number of bytes read so far.
+    uint64_t         BytesRead;     /// The total number of bytes read so far.
     uint32_t         Status;        /// Combination of io_rdq_file_status_e.
     DWORD            OSError;       /// Any error code returned by the OS.
     uint32_t         RangeCount;    /// The number of ranges defined for the file.
@@ -216,8 +216,8 @@ struct io_rdq_file_t
     io_range_t       RangeList[NR]; /// Range data, converted to (Begin, End) pairs.
     io_returnq_t    *ReturnQueue;   /// The SRSW FIFO for returning buffers from the PC.
     size_t           ReturnCount;   /// The number of returns pending for this file.
-    size_t           BytesTotal;    /// The total number of bytes to be read for the whole job.
-    size_t           FileSize;      /// The total size of the file, in bytes.
+    uint64_t         BytesTotal;    /// The total number of bytes to be read for the whole job.
+    uint64_t         FileSize;      /// The total size of the file, in bytes.
     uint64_t         NanosEnq;      /// Timestamp when job was added.
     uint64_t         NanosDeq;      /// Timestamp when job was started.
     uint64_t         NanosEnd;      /// Timestamp when job finished being read.
@@ -267,7 +267,7 @@ static bool io_create_srsw_fifo(io_srsw_fifo_t<T> *fifo, uint32_t capacity)
     // ensure we have a valid fifo and that the capacity is a power-of-two.
     // the capacity being a non-zero power-of-two is a requirement for correct
     // functioning of the queue.
-    if ((fifo != NULL) && (capacity > 0) && ((capacity & (capacity-1) == 0)))
+    if ((fifo != NULL) && (capacity > 0) && ((capacity & (capacity-1)) == 0))
     {
         io_srsw_flq_clear(fifo->Queue, capacity);
         fifo->Store     = (T*) malloc( capacity * sizeof(T) );
@@ -377,7 +377,7 @@ static bool io_create_srsw_waitable_fifo(io_srsw_waitable_fifo_t<T> *fifo, uint3
     // ensure we have a valid fifo and that the capacity is a power-of-two.
     // the capacity being a non-zero power-of-two is a requirement for correct
     // functioning of the queue.
-    if ((fifo != NULL) && (capacity > 0) && ((capacity & (capacity-1) == 0)))
+    if ((fifo != NULL) && (capacity > 0) && ((capacity & (capacity-1)) == 0))
     {
         fifo->NotEmpty  = CreateEvent(NULL, FALSE, FALSE, NULL);
         fifo->NotFull   = CreateEvent(NULL, FALSE, TRUE , NULL);
@@ -659,11 +659,11 @@ static size_t physical_sector_size(HANDLE file)
 /// @param The input value, which may or may not be a power of two.
 /// @param min The minimum power-of-two value, which must also be non-zero.
 /// @return A power-of-two that is greater than or equal to value.
-static inline size_t pow2_ge(size_t value, size_t min)
+static inline uint32_t pow2_ge(uint32_t value, uint32_t min)
 {
     assert((min > 0));
     assert((min & (min - 1)) == 0);
-    size_t x = min;
+    uint32_t x = min;
     while (x < value)
         x  <<= 1;
     return x;
@@ -686,74 +686,6 @@ static inline size_t align_up(size_t size, size_t pow2)
 static inline size_t clamp_to(size_t size, size_t limit)
 {
     return (size > limit) ? limit : size;
-}
-
-/// @summary Redirect a call to CancelIoEx to CancelIo on systems that don't support the Ex version.
-/// @param file The handle of the file whose I/O is being cancelled.
-/// @param aio Ignored. See MSDN for CancelIoEx.
-/// @return See MSDN for CancelIo.
-static BOOL WINAPI CancelIoEx_Fallback(HANDLE file, OVERLAPPED* /*aio*/)
-{
-    return CancelIo(file);
-}
-
-/// @summary Redirect a call to GetNativeSystemInfo to GetSystemInfo.
-/// @param sys_info The SYSTEM_INFO structure to populate.
-static void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
-{
-    GetSystemInfo(sys_info);
-}
-
-/// @summary Redirect a call to GetOverlappedResultEx to GetOverlapped result 
-/// on systems that don't support the Ex version. 
-/// @param file The file handle associated with the I/O operation.
-/// @param aio The OVERLAPPED structure representing the I/O operation.
-/// @param bytes_transferred On return, this location stores the number of bytes transferred,
-/// @param timeout Specify 0 to check the status and return immediately. Any non-zero value 
-/// will cause the call to block until status information is available.
-/// @param alertable Ignored. See MSDN for GetOverlappedResultEx.
-static BOOL WINBASEAPI GetOverlappedResultEx_Fallback(HANDLE file, OVERLAPPED *aio, DWORD *bytes_transferred, DWORD timeout, BOOL /*alertable*/)
-{
-    // for our use case, timeout will always be 0 (= don't wait).
-    return GetOverlappedResult(file, aio, bytes_transferred, timeout ? TRUE : FALSE);
-}
-
-/// @summary Redirect a call to SetProcessWorkingSetSizeEx to SetProcessWorkingSetSize
-/// on systems that don't support the Ex version.
-/// @param process A handle to the process, or GetCurrentProcess() pseudo-handle.
-/// @param minimum The minimum working set size, in bytes.
-/// @param maximum The maximum working set size, in bytes.
-/// @param flags Ignored. See MSDN for SetProcessWorkingSetSizeEx.
-/// @return See MSDN for SetProcessWorkingSetSize.
-static BOOL WINAPI SetProcessWorkingSetSizeEx_Fallback(HANDLE process, SIZE_T minimum, SIZE_T maximum, DWORD /*flags*/)
-{
-    return SetProcessWorkingSetSize(process, minimum, maximum);
-}
-
-/// @summary Loads function entry points that may not be available at compile 
-/// time with some build environments.
-static void resolve_kernel_apis(void)
-{
-    if (_ResolveKernelAPIs_)
-    {   // it's a safe assumption that kernel32.dll is mapped into our process
-        // address space already, and will remain mapped for the duration of execution.
-        // note that some of these APIs are Vista/WS2008+ only, so make sure that we 
-        // have an acceptable fallback in each case to something available earlier.
-        HMODULE kernel = GetModuleHandle("kernel32.dll");
-        if (kernel != NULL)
-        {
-            CancelIoEx_Func                 = (CancelIoExFn)                 GetProcAddress(kernel, "CancelIoEx");
-            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
-            GetOverlappedResultEx_Func      = (GetOverlappedResultExFn)      GetProcAddress(kernel, "GetOverlappedResultEx");
-            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
-        }
-        // fallback if any of these APIs are not available.
-        if (CancelIoEx_Func                 == NULL) CancelIoEx_Func = CancelIoEx_Fallback;
-        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
-        if (GetOverlappedResultEx_Func      == NULL) GetOverlappedResultEx_Func = GetOverlappedResultEx_Fallback;
-        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
-        _ResolveKernelAPIs_ = false;
-    }
 }
 
 /// @summary Performs any one-time initialization for the Windows platforms.
@@ -789,6 +721,75 @@ static inline uint64_t io_timestamp(void)
     LARGE_INTEGER tsf = _Frequency_;
     QueryPerformanceCounter(&tsc);
     return (SEC_TO_NANOSEC * uint64_t(tsc.QuadPart) / uint64_t(tsf.QuadPart));
+}
+
+/// @summary Redirect a call to CancelIoEx to CancelIo on systems that don't support the Ex version.
+/// @param file The handle of the file whose I/O is being cancelled.
+/// @param aio Ignored. See MSDN for CancelIoEx.
+/// @return See MSDN for CancelIo.
+static BOOL WINAPI CancelIoEx_Fallback(HANDLE file, OVERLAPPED* /*aio*/)
+{
+    return CancelIo(file);
+}
+
+/// @summary Redirect a call to GetNativeSystemInfo to GetSystemInfo.
+/// @param sys_info The SYSTEM_INFO structure to populate.
+static void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
+{
+    GetSystemInfo(sys_info);
+}
+
+/// @summary Redirect a call to GetOverlappedResultEx to GetOverlapped result 
+/// on systems that don't support the Ex version. 
+/// @param file The file handle associated with the I/O operation.
+/// @param aio The OVERLAPPED structure representing the I/O operation.
+/// @param bytes_transferred On return, this location stores the number of bytes transferred,
+/// @param timeout Specify 0 to check the status and return immediately. Any non-zero value 
+/// will cause the call to block until status information is available.
+/// @param alertable Ignored. See MSDN for GetOverlappedResultEx.
+static BOOL WINAPI GetOverlappedResultEx_Fallback(HANDLE file, OVERLAPPED *aio, DWORD *bytes_transferred, DWORD timeout, BOOL /*alertable*/)
+{
+    // for our use case, timeout will always be 0 (= don't wait).
+    return GetOverlappedResult(file, aio, bytes_transferred, timeout ? TRUE : FALSE);
+}
+
+/// @summary Redirect a call to SetProcessWorkingSetSizeEx to SetProcessWorkingSetSize
+/// on systems that don't support the Ex version.
+/// @param process A handle to the process, or GetCurrentProcess() pseudo-handle.
+/// @param minimum The minimum working set size, in bytes.
+/// @param maximum The maximum working set size, in bytes.
+/// @param flags Ignored. See MSDN for SetProcessWorkingSetSizeEx.
+/// @return See MSDN for SetProcessWorkingSetSize.
+static BOOL WINAPI SetProcessWorkingSetSizeEx_Fallback(HANDLE process, SIZE_T minimum, SIZE_T maximum, DWORD /*flags*/)
+{
+    return SetProcessWorkingSetSize(process, minimum, maximum);
+}
+
+/// @summary Loads function entry points that may not be available at compile 
+/// time with some build environments.
+static void resolve_kernel_apis(void)
+{
+    if (_ResolveKernelAPIs_)
+    {   // it's a safe assumption that kernel32.dll is mapped into our process
+        // address space already, and will remain mapped for the duration of execution.
+        // note that some of these APIs are Vista/WS2008+ only, so make sure that we 
+        // have an acceptable fallback in each case to something available earlier.
+        HMODULE kernel = GetModuleHandleA("kernel32.dll");
+        if (kernel != NULL)
+        {
+            CancelIoEx_Func                 = (CancelIoExFn)                 GetProcAddress(kernel, "CancelIoEx");
+            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
+            GetOverlappedResultEx_Func      = (GetOverlappedResultExFn)      GetProcAddress(kernel, "GetOverlappedResultEx");
+            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        }
+        // fallback if any of these APIs are not available.
+        if (CancelIoEx_Func                 == NULL) CancelIoEx_Func = CancelIoEx_Fallback;
+        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
+        if (GetOverlappedResultEx_Func      == NULL) GetOverlappedResultEx_Func = GetOverlappedResultEx_Fallback;
+        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
+        _ResolveKernelAPIs_ = false;
+        io_time_init();
+    }
 }
 
 /// @summary Allocates buffer space for I/O read buffers associated with a 
@@ -1138,7 +1139,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
         io_atomic_write_uint32_aligned(flags_addr, new_flags);
         
         // move jobs from pending to completed.
-        uint32_t const npending = io_srsw_fifo_count(rdq->PendingQueue);
+        size_t const npending = io_srsw_fifo_count(rdq->PendingQueue);
         for (size_t  i = 0; i < npending; ++i)
         {
             io_rdq_job_t job;
@@ -1151,7 +1152,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
                 rdf.BytesRead    = 0;
                 rdf.Status       = IO_RDQ_FILE_CANCELLED;
                 rdf.OSError      = ERROR_SUCCESS;
-                rdf.RangeCount   = job.RangeCount;
+                rdf.RangeCount   = (uint32_t) job.RangeCount;
                 rdf.RangeIndex   = 0;
                 rdf.ReturnQueue  = NULL;
                 rdf.ReturnCount  = 0;
@@ -1208,7 +1209,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
 
     // process the cancellation queue. any items to be cancelled here may 
     // have the cancellation completed asynchronously, if they have pending AIO.
-    uint32_t const ncancel = io_srsw_fifo_count(rdq->CancelQueue);
+    size_t const ncancel = io_srsw_fifo_count(rdq->CancelQueue);
     for (size_t  i = 0;  i < ncancel; ++i)
     {
         uint32_t id;
@@ -1362,7 +1363,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     rdf->BytesRead        = 0;
     rdf->Status           = IO_RDQ_FILE_NONE;
     rdf->OSError          = ERROR_SUCCESS;
-    rdf->RangeCount       = job.RangeCount;
+    rdf->RangeCount       = (uint32_t) job.RangeCount;
     rdf->RangeIndex       = 0;
     rdf->ReturnQueue      = returnq;
     rdf->ReturnCount      = 0;
@@ -1398,7 +1399,7 @@ static void io_rdq_poll_sync(io_rdq_t *rdq)
     {
         io_rdq_file_t &rdf = rdq->ActiveJobList[i];
         io_range_t    &rng = rdf.RangeList[rdf.RangeIndex];
-        DWORD          amt = rng.Amount - rng.Offset;
+        DWORD          amt = (DWORD) (rng.Amount - rng.Offset);
         DWORD          nbt = 0;
         BOOL           res = FALSE;
 
@@ -1582,7 +1583,7 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
             // 'Asynchronous Disk I/O Appears as Synchronous' located at 
             // http://support.microsoft.com/kb/156932
             io_range_t &rng = rdf.RangeList[rdf.RangeIndex];
-            DWORD       amt = rng.Amount - rng.Offset;
+            DWORD       amt = (DWORD) (rng.Amount - rng.Offset);
             BOOL        res = FALSE;
 
             if (rdq->Flags & IO_RDQ_FLAGS_UNBUFFERED)
@@ -1745,8 +1746,9 @@ bool LLCALL_C io_enumerate_files(io_file_list_t *dest, char const *path, char co
 
 io_rdpendq_t* LLCALL_C io_create_jobq(size_t capacity)
 {
+    uint32_t      nitem = (uint32_t     ) capacity;
     io_rdpendq_t *pendq = (io_rdpendq_t*) malloc(sizeof(io_rdpendq_t));
-    if (io_create_srsw_waitable_fifo(pendq, pow2_ge(capacity, 1)))
+    if (io_create_srsw_waitable_fifo(pendq, pow2_ge(nitem, 1)))
     {   // the queue was created successfully.
         return pendq;
     }
@@ -1778,8 +1780,9 @@ bool LLCALL_C io_jobp_wait_not_empty(io_rdpendq_t *pendq, uint32_t timeout_ms)
 
 io_rddoneq_t* LLCALL_C io_create_completionq(size_t capacity)
 {
+    uint32_t      nitem = (uint32_t     ) capacity;
     io_rddoneq_t *doneq = (io_rddoneq_t*) malloc(sizeof(io_rddoneq_t));
-    if (io_create_srsw_waitable_fifo(doneq, pow2_ge(capacity, 1)))
+    if (io_create_srsw_waitable_fifo(doneq, pow2_ge(nitem, 1)))
     {   // the queue was created successfully.
         return doneq;
     }
@@ -1811,8 +1814,9 @@ bool LLCALL_C io_completionp_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeou
 
 io_rdstopq_t* LLCALL_C io_create_cancelq(size_t capacity)
 {
+    uint32_t      nitem   = (uint32_t     ) capacity;
     io_rdstopq_t *cancelq = (io_rdstopq_t*) malloc(sizeof(io_rdstopq_t));
-    if (io_create_srsw_fifo(cancelq, pow2_ge(capacity, 1)))
+    if (io_create_srsw_fifo(cancelq, pow2_ge(nitem, 1)))
     {   // the queue was created successfully.
         return cancelq;
     }
@@ -1834,8 +1838,9 @@ void LLCALL_C io_delete_cancelq(io_rdstopq_t *cancelq)
 
 io_rdopq_t* LLCALL_C io_create_dataq(size_t capacity)
 {
+    uint32_t    nitem = (uint32_t   ) capacity;
     io_rdopq_t *dataq = (io_rdopq_t*) malloc(sizeof(io_rdopq_t));
-    if (io_create_srsw_waitable_fifo(dataq, pow2_ge(capacity, 1)))
+    if (io_create_srsw_waitable_fifo(dataq, pow2_ge(nitem, 1)))
     {   // the queue was created successfully.
         return dataq;
     }
@@ -1943,10 +1948,13 @@ void LLCALL_C io_delete_rdq(io_rdq_t *rdq)
 {
     if (rdq != NULL)
     {
-        uint32_t nreturns  = rdq->FinishCount;
-        uint32_t nactive   = rdq->ActiveCount;
-        uint32_t npending  = rdq->PendingQueue != NULL ? io_srsw_fifo_count(rdq->PendingQueue) : 0;
+        size_t nreturns  = rdq->FinishCount;
+        size_t nactive   = rdq->ActiveCount;
+        size_t npending  = rdq->PendingQueue != NULL ? io_srsw_fifo_count(rdq->PendingQueue) : 0;
         assert(nreturns == 0 && nactive == 0 && npending == 0);
+        UNUSED_LOCAL(nreturns);
+        UNUSED_LOCAL(nactive );
+        UNUSED_LOCAL(npending);
 
         if (rdq->ActiveJobAIO != NULL && (rdq->Flags & IO_RDQ_FLAGS_ASYNC))
         {   // clean up the manual reset events allocated to the AIOs.
@@ -1993,11 +2001,11 @@ void LLCALL_C io_delete_rdq(io_rdq_t *rdq)
 
 bool LLCALL_C io_rdq_poll_idle(io_rdq_t *rdq)
 {
-    uint32_t const noverflow = uint32_t(rdq->OverflowCount);
-    uint32_t const nactive   = uint32_t(rdq->ActiveCount);
-    uint32_t const nfinish   = uint32_t(rdq->FinishCount);
-    uint32_t const npending  = io_srsw_fifo_count(rdq->PendingQueue);
-    return (noverflow == 0  && nactive == 0 && nfinish == 0 && npending == 0);
+    size_t const noverflow = rdq->OverflowCount;
+    size_t const nactive   = rdq->ActiveCount;
+    size_t const nfinish   = rdq->FinishCount;
+    size_t const npending  = io_srsw_fifo_count(rdq->PendingQueue);
+    return (noverflow == 0 && nactive == 0 && nfinish == 0 && npending == 0);
 }
 
 bool LLCALL_C io_rdq_wait_idle(io_rdq_t *rdq, uint32_t timeout_ms)
