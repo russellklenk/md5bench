@@ -72,6 +72,10 @@ static LARGE_INTEGER                _Frequency_                     = {0};
 #define FILE_ANY_ACCESS                    0
 #define FILE_DEVICE_MASS_STORAGE           0x0000002d
 
+#ifndef ERROR_OFFSET_ALIGNMENT_VIOLATION
+#define ERROR_OFFSET_ALIGNMENT_VIOLATION   0x00000147
+#endif
+
 #ifndef QUOTA_LIMITS_HARDWS_MIN_ENABLE
 #define QUOTA_LIMITS_HARDWS_MIN_ENABLE     0x00000001
 #endif
@@ -1151,7 +1155,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
                 rdf.NanosEnd     = rdf.NanosDeq;
                 for (size_t i = 0;  i < job.RangeCount; ++i)
                 {   // do calculate an accurate total job bytes count.
-                    rdf.BytesTotal   += job.RangeList[i].Offset + job.RangeList[i].Amount;
+                    rdf.BytesTotal   += job.RangeList[i].Amount;
                 }   // if there are no jobs, the BytesTotal remains 0.
                 io_complete_job(rdq, &rdf, job.JobId);
             }
@@ -1282,7 +1286,9 @@ static size_t io_flush_overflow(io_rdq_t *rdq)
 /// @param rdq The read queue managing the job.
 /// @param rdf The job state data to modify.
 /// @param job The job description.
-static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const &job)
+/// @param oserr On return, this is set to the value returned by GetLastError(),
+/// if the function returns false; otherwise, it is set to ERROR_SUCCESS.
+static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const &job, DWORD &oserr)
 {
     HANDLE   file  = INVALID_HANDLE_VALUE;
     DWORD    flags = FILE_FLAG_SEQUENTIAL_SCAN;
@@ -1303,6 +1309,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     file = CreateFileA(job.Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, flags, NULL);
     if (file == INVALID_HANDLE_VALUE)
     {   // the file could not be opened, so fail.
+        oserr = GetLastError();
         return false;
     }
 
@@ -1326,6 +1333,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     {   // if we are using direct I/O, these requirements MUST be met.
         if((flags & FILE_FLAG_NO_BUFFERING) != 0 && (ssize > 0))
         {   // ...but they are not, so fail.
+            oserr = ERROR_OFFSET_ALIGNMENT_VIOLATION;
             CloseHandle(file);
             return false;
         }
@@ -1335,6 +1343,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     io_returnq_t *returnq = io_create_returnq();
     if (returnq == NULL)
     {   // a return queue is required for correct functioning.
+        oserr = ERROR_OUTOFMEMORY;
         CloseHandle(file);
         return false;
     }
@@ -1353,13 +1362,12 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     rdf->BytesTotal       = 0;
     rdf->FileSize         = fsize;
     rdf->NanosEnq         = job.EnqueueTime;
-    rdf->NanosDeq         = io_timestamp();
     rdf->NanosEnd         = 0;
     for (size_t i = 0;  i < job.RangeCount; ++i)
     {   // convert ranges to (Begin, End) and calculate total number of bytes to read.
         rdf->RangeList[i].Offset = job.RangeList[i].Offset;
         rdf->RangeList[i].Amount = job.RangeList[i].Offset + job.RangeList[i].Amount;
-        rdf->BytesTotal         += job.RangeList[i].Offset + job.RangeList[i].Amount;
+        rdf->BytesTotal         += job.RangeList[i].Amount;
     }
     if  (job.RangeCount == 0)
     {   // the job consists of the entire file.
@@ -1367,6 +1375,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
         rdf->RangeList[0].Amount = fsize;
         rdf->BytesTotal          = fsize;
     }
+    oserr = ERROR_SUCCESS;
     return true;
 }
 
@@ -1895,5 +1904,119 @@ bool LLCALL_C io_rdq_submit(io_rdq_t *rdq, io_rdq_job_t const &job)
         job_copy.RangeCount = IO_MAX_RANGES;
 
     return io_srsw_fifo_put(rdq->PendingQueue, job_copy);
+}
+
+bool LLCALL_C io_rdq_wait_io(io_rdq_t *rdq, uint32_t timeout_ms)
+{
+    if ((rdq->Flags & IO_RDQ_FLAGS_ASYNC) == 0)
+    {   // this is not an async queue, so we can always begin a new poll.
+        return true;
+    }
+    if (rdq->ActiveCount == 0)
+    {   // there are no active files, so begin a new poll to see if there
+        // are any jobs in the pending queue.
+        return true;
+    }
+    if (rdq->OverflowCount > 0)
+    {   // there are overflow buffers pending, so spin as fast as we can 
+        // to try and flush the overflow queue and return to normal operation.
+        return true;
+    }
+    // at this point, we have active jobs and are allowed to perform async I/O.
+    // note that we could be woken up because of a queued APC also.
+    DWORD n      = (DWORD) rdq->ActiveCount;
+    DWORD ok_min = WAIT_OBJECT_0;
+    DWORD ok_max = WAIT_OBJECT_0    + n;
+    DWORD ab_min = WAIT_ABANDONED_0;
+    DWORD ab_max = WAIT_ABANDONED_0 + n;
+    DWORD result = WaitForMultipleObjectsEx(n, rdq->ActiveJobWait, FALSE, timeout_ms, TRUE);
+    if  (result >= ok_min && result < ok_max) return true;  // An event was signaled.
+    if  (result >= ab_min && result < ab_max) return false; // One or more handles was closed?
+    if  (result == WAIT_IO_COMPLETION)        return true;  // An APC was queued.
+    if  (result == WAIT_TIMEOUT)              return false; // The timeout interval elapsed.
+    if  (result == WAIT_FAILED)               return false; // Generic error.
+    return false;
+}
+
+void LLCALL_C io_rdq_poll(io_rdq_t *rdq)
+{
+    // process any pending cancellations. if a CANCEL_ALL operation is 
+    // pending, then this may block until all active jobs have been cancelled.
+    io_process_cancellations(rdq);
+
+    // attempt to push any queued read operations (at most, rdq->ActiveCapacity)
+    // to the DataQueue for processing. if there are any queued read operations 
+    // remaining in the overflow buffer, we cannot continue with the poll cycle.
+    if (io_flush_overflow(rdq))
+    {   // there are still buffers in the overflow queue.
+        return;
+    }
+
+    // dequeue and start pending jobs until we've reached capacity, or 
+    // no pending jobs remain in the pending job queue.
+    bool          reset_idle = false;
+    size_t const nconcurrent = rdq->ActiveCapacity;
+    while (rdq->ActiveCount  < nconcurrent)
+    {
+        io_rdq_job_t job;
+        if (io_srsw_fifo_get(rdq->PendingQueue, job) == false)
+        {   // there are no more pending jobs in the queue.
+            break;
+        }
+
+        // we popped a pending job from the queue.
+        if (reset_idle == false)
+        {   // the I/O manager is no longer idle.
+            ResetEvent(rdq->Idle);
+            reset_idle = true;
+        }
+
+        // attempt to open the file and allocate resource for the job.
+        DWORD          oserr =  ERROR_SUCCESS;
+        uint64_t  start_time =  io_timestamp();
+        size_t  active_index =  rdq->ActiveCount;
+        io_rdq_file_t   *rdf = &rdq->ActiveJobList[active_index];
+        if (io_prepare_job(rdq, rdf, job, oserr) == false)
+        {   // fill out an io_rdq_file_t representing the failed operation.
+            io_rdq_file_t rdt;
+            rdt.File         = INVALID_HANDLE_VALUE;
+            rdt.TargetBuffer = NULL;
+            rdt.SectorSize   = 0;
+            rdt.BytesRead    = 0;
+            rdt.Status       = IO_RDQ_FILE_ERROR;
+            rdt.OSError      = oserr;
+            rdt.RangeCount   = 0;
+            rdt.RangeIndex   = 0;
+            rdt.ReturnQueue  = NULL;
+            rdt.ReturnCount  = 0;
+            rdt.BytesTotal   = 0;
+            rdt.FileSize     = 0;
+            rdt.NanosEnq     = job.EnqueueTime;
+            rdt.NanosDeq     = start_time;
+            rdt.NanosEnd     = start_time;
+            for (size_t i = 0; i < job.RangeCount; ++i)
+            {
+                rdt.BytesTotal  += job.RangeList[i].Amount;
+            }
+            io_complete_job(rdq, &rdt, job.JobId);
+            continue;
+        }
+
+        // the job was initialized, so put it into active status.
+        // note that io_prepare_job wrote into rdq->ActiveJobList[active_index].
+        rdf->NanosDeq     = start_time;
+        rdq->ActiveJobIds [active_index] = job.JobId;
+        rdq->ActiveJobWait[active_index] = rdq->ActiveJobAIO[active_index].hEvent;
+        rdq->ActiveCount++;
+    }
+
+    // update and schedule I/O operations against the active job list.
+    if (rdq->Flags & IO_RDQ_FLAGS_ASYNC) io_rdq_poll_async(rdq);
+    else io_rdq_poll_sync(rdq);
+
+    // perform job cleanup, move active->finished and remove finished.
+    // this may update rdq->ActiveCount and signal rdq->Idle.
+    io_cull_finished_jobs(rdq);
+    io_finish_jobs(rdq);
 }
 

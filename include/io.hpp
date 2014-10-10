@@ -309,15 +309,13 @@ IO_C_API(void) io_delete_rdq(io_rdq_t *rdq);
 
 /// @summary Determines whether the queue is idle, meaning that there are no 
 /// pending jobs, no active jobs, and no jobs waiting on buffers to be returned.
-/// This is typically used by either the job manager or the completion monitor.
 /// @param rdq The read queue to poll for status.
 /// @return true if the queue is idle.
 IO_C_API(bool) io_rdq_poll_idle(io_rdq_t *rdq);
 
 /// @summary Block the calling thread until the queue becomes idle, meaning 
 /// that there are no pending jobs, no active jobs, and no jobs waiting on 
-/// buffers to be returned. This is typically used by either the job manager 
-/// or the completion monitor.
+/// buffers to be returned. This function should only be used by the job manager.
 /// @param rdq The read queue to wait on.
 /// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
 /// Specify IO_WAIT_FOREVER to block indefinitely.
@@ -327,23 +325,42 @@ IO_C_API(bool) io_rdq_wait_idle(io_rdq_t *rdq, uint32_t timeout_ms);
 
 /// @summary Cancels all pending and active jobs. Note that there may still be
 /// jobs waiting for buffers to be returned; if this is the case, the queue will
-/// report as not idle after the next poll cycle. This is typically used by the job manager.
+/// report as not idle after the next poll cycle. This function should only 
+/// ever be called by the job manager.
 /// @param rdq The target queue.
 IO_C_API(void) io_rdq_cancel_all(io_rdq_t *rdq);
 
-/// @summary Cancels a single specific job on the next poll cycle. This is 
-/// typically used by the job manager.
+/// @summary Cancels a single specific job on the next poll cycle. This function
+/// should only ever be called by the job manager.
 /// @param rdq The target queue.
 /// @param id The identifier of the job to cancel, as was specified on the job
 /// definition passed to io_rdq_submit() used to add the job.
 IO_C_API(void) io_rdq_cancel_one(io_rdq_t *rdq, uint32_t id);
 
 /// @summary Submits a new job to the pending queue of a concurrent read queue.
+/// This function should only ever be called by the job manager.
 /// @param rdq The target queue.
 /// @param job A description of the file operation.
 /// @return true if the job was added to the pending queue, or false if the 
 /// pending queue is full and the job could not be submitted.
 IO_C_API(bool) io_rdq_submit(io_rdq_t *rdq, io_rdq_job_t const &job);
+
+/// @summary Blocks the calling thread until a pending asynchronous I/O operation
+/// indicates that it has completed. For synchronous queues, return immediately.
+/// This function should only be called by the I/O manager thread.
+/// @param rdq The read queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the next poll cycle should be executed, or false if the 
+/// timeout interval elapsed, or an error occurred while waiting.
+IO_C_API(bool) io_rdq_wait_io(io_rdq_t *rdq, uint32_t timeout_ms);
+
+/// @summary Implements a single read queue poll cycle, which checks the status 
+/// of outstanding I/O operations, starts new I/O operations, processes pending
+/// jobs and job cancellations, and processes buffer returns. This function 
+/// should only ever be called by the I/O manager thread.
+/// @param rdq The read queue to poll.
+IO_C_API(void) io_rdq_poll(io_rdq_t *rdq);
 
 #ifdef __cplusplus
 }; // extern "C"
