@@ -294,6 +294,92 @@ IO_C_API(void) io_format_file_list(FILE *fp, io_file_list_t const *list);
 /// @return true if enumeration completed without error.
 IO_C_API(bool) io_enumerate_files(io_file_list_t *dest, char const *path, char const *filter, bool recurse);
 
+/// @summary Creates a new pending job queue with the specified capacity.
+/// @param capacity The maximum number of pending jobs.
+/// @return The new job queue, or NULL.
+IO_C_API(io_rdpendq_t*) io_create_jobq(size_t capacity);
+
+/// @summary Frees resources associated with a pending job queue.
+/// @pendq The pending job queue to delete.
+IO_C_API(void) io_delete_jobq(io_rdpendq_t *pendq);
+
+/// @summary Block the calling thread until the pending job queue is not full. 
+/// This function can be called from the job manager thread.
+/// @param pendq The pending job queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the pending job queue is now not full, or false if the 
+/// timeout interval elapsed or an error occurred during the wait. Always check
+/// whether the queue is full after this function returns.
+IO_C_API(bool) io_jobq_wait_not_full(io_rdpendq_t *pendq, uint32_t timeout_ms);
+
+/// @summary Block the calling thread until the pending job queue is not empty.
+/// This function can be called from the I/O manager thread.
+/// @param pendq The pending job queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the pending job queue is now not empty, or false if the 
+/// timeout interval elapsed or an error occurred during the wait. Always check
+/// whether the queue is empty after this function returns.
+IO_C_API(bool) io_jobq_wait_not_empty(io_rdpendq_t *pendq, uint32_t timeout_ms);
+
+/// @summary Creates a new job completion queue with the specified capacity.
+/// @param capacity The maximum number of pending job completions.
+/// @return The new completion queue, or NULL.
+IO_C_API(io_rddoneq_t*) io_create_completionq(size_t capacity);
+
+/// @summary frees resources associated with a job completion queue.
+/// @param doneq The completion queue to delete.
+IO_C_API(void) io_delete_completionq(io_rddoneq_t* doneq);
+
+/// @summary Block the calling thread until the job completion queue is not full. 
+/// This function can be called from the I/O manager thread.
+/// @param doneq The job completion queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the job completion queue is now not full, or false if the 
+/// timeout interval elapsed or an error occurred during the wait. Always check
+/// whether the queue is full after this function returns.
+IO_C_API(bool) io_completionq_wait_not_full(io_rddoneq_t *doneq, uint32_t timeout_ms);
+
+/// @summary Block the calling thread until the job completion queue is not empty.
+/// This function can be called from the completion manager thread.
+/// @param doneq The job completion queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the pending job queue is now not empty, or false if the 
+/// timeout interval elapsed or an error occurred during the wait. Always check
+/// whether the queue is empty after this function returns.
+IO_C_API(bool) io_completionq_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeout_ms);
+
+/// @summary Creates a new job cancellation queue with the specified capacity.
+/// @param capacity The maximum number of pending job cancellations.
+/// @return The new cancellation queue, or NULL.
+IO_C_API(io_rdstopq_t*) io_create_cancelq(size_t capacity);
+
+/// @summary Frees resources associated with a job cancellation queue.
+/// @param stopq The job cancellation queue to delete.
+IO_C_API(void) io_delete_cancelq(io_rdstopq_t *stopq);
+
+/// @summary Creates a new data buffer queue with the specified capacity.
+/// @param capacity The maximum number of pending data buffers.
+/// @return The new data buffer queue, or NULL.
+IO_C_API(io_rdopq_t*) io_create_dataq(size_t capacity);
+
+/// @summary Frees resources associated with a data buffer queue.
+/// @param opq The data buffer queue to delete.
+IO_C_API(void) io_delete_dataq(io_rdopq_t *opq);
+
+/// @summary Block the calling thread until the data buffer queue is not empty.
+/// This function can be called from the data processing coordinator thread.
+/// @param opq The data buffer queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the data buffer queue is now not empty, or false if the 
+/// timeout interval elapsed or an error occurred during the wait. Always check
+/// whether the queue is empty after this function returns.
+IO_C_API(bool) io_dataq_wait_not_empty(io_rdopq_t *opq, uint32_t timeout_ms);
+
 /// @summary Allocates resources for and initializes a concurrent read queue.
 /// @param config Options used to specify the queue behavior. This structure 
 /// will be updated with the actual configuration values used.
@@ -361,6 +447,13 @@ IO_C_API(bool) io_rdq_wait_io(io_rdq_t *rdq, uint32_t timeout_ms);
 /// should only ever be called by the I/O manager thread.
 /// @param rdq The read queue to poll.
 IO_C_API(void) io_rdq_poll(io_rdq_t *rdq);
+
+/// @summary Returns a data buffer to the pool. This function is called from 
+/// the data processing coordinator thread only.
+/// @param returnq The destination return queue.
+/// @param buffer The buffer being returned.
+/// @return true if the buffer was returned.
+IO_C_API(bool) io_return_buffer(io_returnq_t *returnq, void *buffer);
 
 #ifdef __cplusplus
 }; // extern "C"

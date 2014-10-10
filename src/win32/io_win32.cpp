@@ -174,7 +174,6 @@ struct io_srsw_fifo_t
 template <typename T>
 struct io_srsw_waitable_fifo_t
 {
-    HANDLE           Empty;         /// A.R.E. signaled when queue goes empty.
     HANDLE           NotEmpty;      /// A.R.E. signaled when queue goes not empty.
     HANDLE           NotFull;       /// A.R.E. signaled when queue goes not full.
     io_srsw_flq_t    Queue;         /// SRSW queue state & capacity. See io.hpp.
@@ -380,7 +379,6 @@ static bool io_create_srsw_waitable_fifo(io_srsw_waitable_fifo_t<T> *fifo, uint3
     // functioning of the queue.
     if ((fifo != NULL) && (capacity > 0) && ((capacity & (capacity-1) == 0)))
     {
-        fifo->Empty     = CreateEvent(NULL, FALSE, TRUE , NULL);
         fifo->NotEmpty  = CreateEvent(NULL, FALSE, FALSE, NULL);
         fifo->NotFull   = CreateEvent(NULL, FALSE, TRUE , NULL);
         io_srsw_flq_clear(fifo->Queue, capacity);
@@ -407,11 +405,6 @@ static void io_delete_srsw_fifo(io_srsw_waitable_fifo_t<T> *fifo)
             CloseHandle(fifo->NotEmpty);
             fifo->NotEmpty  = INVALID_HANDLE_VALUE;
         }
-        if (fifo->Empty != INVALID_HANDLE_VALUE)
-        {
-            CloseHandle(fifo->Empty);
-            fifo->Empty  = INVALID_HANDLE_VALUE;
-        }
         if (fifo->Store != NULL)
         {
             free(fifo->Store);
@@ -430,7 +423,6 @@ static void io_flush_srsw_fifo(io_srsw_waitable_fifo_t<T> *fifo)
 {
     io_srsw_flq_clear(fifo->Queue, fifo->Queue.Capacity);
     SetEvent(fifo->NotFull);
-    SetEvent(fifo->Empty);
 }
 
 /// @summary Retrieves the number of items 'currently' in the queue.
@@ -458,21 +450,6 @@ template <typename T>
 static inline bool io_srsw_fifo_is_full(io_srsw_waitable_fifo_t<T> *fifo)
 {
     return io_srsw_flq_full(fifo->Queue);
-}
-
-/// @summary Blocks the calling thread until the queue reaches an empty state,
-/// or the specified timeout interval has elapsed. The caller must check the 
-/// current state of the queue using io_srsw_fifo_is_empty(fifo) after being 
-/// woken up, as the queue may no longer be empty.
-/// @param fifo The queue to wait on.
-/// @param timeout_ms The maximum number of milliseconds to wait.
-/// @return true if the queue has reached an empty state, or false if the 
-/// timeout interval has elapsed or an error has occurred.
-template <typename T>
-bool io_srsw_fifo_wait_empty(io_srsw_waitable_fifo_t<T> *fifo, uint32_t timeout_ms)
-{
-    DWORD   result  = WaitForSingleObjectEx(fifo->Empty, timeout_ms, TRUE);
-    return (result == WAIT_OBJECT_0);
 }
 
 /// @summary Blocks the calling thread until the queue reaches a non-empty 
@@ -544,8 +521,7 @@ bool io_srsw_fifo_get(io_srsw_waitable_fifo_t<T> *fifo, T &item)
         PROCESSOR_MFENCE_READ;
         io_srsw_flq_pop(fifo->Queue);
         SetEvent(fifo->NotFull);
-        if (count == 1) SetEvent(fifo->Empty);
-        else SetEvent(fifo->NotEmpty);
+        if (count > 1) SetEvent(fifo->NotEmpty);
         return true;
     }
     return false;
@@ -677,6 +653,20 @@ static size_t physical_sector_size(HANDLE file)
         return DefaultPhysicalSectorSize;
     }
     else return desc.BytesPerPhysicalSector;
+}
+
+/// @summary Calculate a power-of-two value greater than or equal to a given value.
+/// @param The input value, which may or may not be a power of two.
+/// @param min The minimum power-of-two value, which must also be non-zero.
+/// @return A power-of-two that is greater than or equal to value.
+static inline size_t pow2_ge(size_t value, size_t min)
+{
+    assert((min > 0));
+    assert((min & (min - 1)) == 0);
+    size_t x = min;
+    while (x < value)
+        x  <<= 1;
+    return x;
 }
 
 /// @summary Rounds a size up to the nearest even multiple of a given power-of-two.
@@ -1015,6 +1005,22 @@ static void io_complete_job(io_rdq_t *rdq, io_rdq_file_t *rdf, uint32_t id)
     io_srsw_fifo_put(rdq->CompleteQueue, res);
 }
 
+/// @summary Processes any pending buffer returns for a job.
+/// @param rdq The concurrent read queue that owns the job.
+/// @param rdf The active or finish-status job.
+static void io_process_returns(io_rdq_t *rdq, io_rdq_file_t *rdf)
+{
+    size_t count  = 0;
+    void  *buffer = NULL;
+    while (io_srsw_fifo_get(rdf->ReturnQueue, buffer))
+    {
+        io_rdbuffer_put(&rdq->BufferManager, buffer);
+        count++;
+    }
+    rdf->ReturnCount -= count;
+    assert(rdf->ReturnCount >= 0);
+}
+
 /// @summary Move a single active job to the finished job list. The job status 
 /// is updated prior to calling this function. Typically, the file handle is 
 /// also closed prior to calling this function.
@@ -1071,7 +1077,8 @@ static bool io_finish(io_rdq_t *rdq, size_t active_index)
 static void io_cull_finished_jobs(io_rdq_t *rdq)
 {
     for (size_t i = 0; i < rdq->ActiveCount; /* empty */)
-    {
+    {   // process any pending buffer returns.
+        io_process_returns(rdq, &rdq->ActiveJobList[i]);
         if (rdq->ActiveJobList[i].File == INVALID_HANDLE_VALUE)
         {
             if (io_finish(rdq, i))
@@ -1736,6 +1743,123 @@ bool LLCALL_C io_enumerate_files(io_file_list_t *dest, char const *path, char co
     return false;
 }
 
+io_rdpendq_t* LLCALL_C io_create_jobq(size_t capacity)
+{
+    io_rdpendq_t *pendq = (io_rdpendq_t*) malloc(sizeof(io_rdpendq_t));
+    if (io_create_srsw_waitable_fifo(pendq, pow2_ge(capacity, 1)))
+    {   // the queue was created successfully.
+        return pendq;
+    }
+    else
+    {   // the queue could not be initialized.
+        if (pendq != NULL) free(pendq);
+        return NULL;
+    }
+}
+
+void LLCALL_C io_delete_jobq(io_rdpendq_t *pendq)
+{
+    if (pendq != NULL)
+    {
+        io_delete_srsw_fifo(pendq);
+        free(pendq);
+    }
+}
+
+bool LLCALL_C io_jobq_wait_not_full(io_rdpendq_t *pendq, uint32_t timeout_ms)
+{
+    return io_srsw_fifo_wait_not_full(pendq, timeout_ms);
+}
+
+bool LLCALL_C io_jobp_wait_not_empty(io_rdpendq_t *pendq, uint32_t timeout_ms)
+{
+    return io_srsw_fifo_wait_not_empty(pendq, timeout_ms);
+}
+
+io_rddoneq_t* LLCALL_C io_create_completionq(size_t capacity)
+{
+    io_rddoneq_t *doneq = (io_rddoneq_t*) malloc(sizeof(io_rddoneq_t));
+    if (io_create_srsw_waitable_fifo(doneq, pow2_ge(capacity, 1)))
+    {   // the queue was created successfully.
+        return doneq;
+    }
+    else
+    {   // the queue could not be initialized.
+        if (doneq != NULL) free(doneq);
+        return NULL;
+    }
+}
+
+void LLCALL_C io_delete_completionq(io_rddoneq_t *doneq)
+{
+    if (doneq != NULL)
+    {
+        io_delete_srsw_fifo(doneq);
+        free(doneq);
+    }
+}
+
+bool LLCALL_C io_completionq_wait_not_full(io_rddoneq_t *doneq, uint32_t timeout_ms)
+{
+    return io_srsw_fifo_wait_not_full(doneq, timeout_ms);
+}
+
+bool LLCALL_C io_completionp_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeout_ms)
+{
+    return io_srsw_fifo_wait_not_empty(doneq, timeout_ms);
+}
+
+io_rdstopq_t* LLCALL_C io_create_cancelq(size_t capacity)
+{
+    io_rdstopq_t *cancelq = (io_rdstopq_t*) malloc(sizeof(io_rdstopq_t));
+    if (io_create_srsw_fifo(cancelq, pow2_ge(capacity, 1)))
+    {   // the queue was created successfully.
+        return cancelq;
+    }
+    else
+    {   // the queue could not be initialized.
+        if (cancelq != NULL) free(cancelq);
+        return NULL;
+    }
+}
+
+void LLCALL_C io_delete_cancelq(io_rdstopq_t *cancelq)
+{
+    if (cancelq != NULL)
+    {
+        io_delete_srsw_fifo(cancelq);
+        free(cancelq);
+    }
+}
+
+io_rdopq_t* LLCALL_C io_create_dataq(size_t capacity)
+{
+    io_rdopq_t *dataq = (io_rdopq_t*) malloc(sizeof(io_rdopq_t));
+    if (io_create_srsw_waitable_fifo(dataq, pow2_ge(capacity, 1)))
+    {   // the queue was created successfully.
+        return dataq;
+    }
+    else
+    {   // the queue could not be initialized.
+        if (dataq != NULL) free(dataq);
+        return NULL;
+    }
+}
+
+void LLCALL_C io_delete_dataq(io_rdopq_t *dataq)
+{
+    if (dataq != NULL)
+    {
+        io_delete_srsw_fifo(dataq);
+        free(dataq);
+    }
+}
+
+bool LLCALL_C io_datap_wait_not_empty(io_rdopq_t *dataq, uint32_t timeout_ms)
+{
+    return io_srsw_fifo_wait_not_empty(dataq, timeout_ms);
+}
+
 io_rdq_t* LLCALL_C io_create_rdq(io_rdq_config_t &config)
 {
     // ensure that our required kernel32 entry points are resolved.
@@ -2018,5 +2142,10 @@ void LLCALL_C io_rdq_poll(io_rdq_t *rdq)
     // this may update rdq->ActiveCount and signal rdq->Idle.
     io_cull_finished_jobs(rdq);
     io_finish_jobs(rdq);
+}
+
+bool LLCALL_C io_return_buffer(io_returnq_t *returnq, void *buffer)
+{
+    return io_srsw_fifo_put(returnq, buffer);
 }
 
