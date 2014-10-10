@@ -40,7 +40,7 @@
 /// @summary Define the maximum number of ranges that can be specified
 /// for reading chunks of a file.
 #ifndef IO_MAX_RANGES
-#define IO_MAX_RANGES      64
+#define IO_MAX_RANGES      16
 #endif
 
 /// @summary Define the maximum number of files that can possibly be active in 

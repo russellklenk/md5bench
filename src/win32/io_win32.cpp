@@ -49,9 +49,19 @@ static uint64_t const SEC_TO_NANOSEC = 1000000000ULL;
 /*///////////////
 //   Globals   //
 ///////////////*/
-/// @summary Store the results of our call to QueryPerformanceFrequency.
-/// This value is set when the first read buffer is created.
-static LARGE_INTEGER g_Frequency = {0};
+// The following functions are not available under MinGW, so kernel32.dll is  
+// loaded and these functions will be resolved manually in io_create_rdq().
+typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
+typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
+typedef BOOL (WINAPI *CancelIoExFn)(HANDLE, OVERLAPPED*);
+typedef BOOL (WINBASEAPI *GetOverlappedResultExFn)(HANDLE, OVERLAPPED*, DWORD*, DWORD, BOOL);
+
+static CancelIoExFn                 CancelIoEx_Func                 = NULL;
+static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
+static GetOverlappedResultExFn      GetOverlappedResultEx_Func      = NULL;
+static SetProcessWorkingSetSizeExFn SetProcessWorkingSetSizeEx_Func = NULL;
+static bool                         _ResolveKernelAPIs_             = true;
+static LARGE_INTEGER                _Frequency_                     = {0};
 
 /*//////////////////
 //   Data Types   //
@@ -119,13 +129,7 @@ typedef struct _STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR {
     DWORD BytesPerPhysicalSector;
     DWORD BytesOffsetForSectorAlignment;
 } STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, *PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR;
-
-// the following are not available under MinGW. we will load kernel32.dll and 
-// resolve these functions manually in io_create_rdbuffer().
-typedef void (WINAPI *GetNativeSystemInfoFn)(SYSTEM_INFO*);
-typedef BOOL (WINAPI *SetProcessWorkingSetSizeExFn)(HANDLE, SIZE_T, SIZE_T, DWORD);
-
-#endif
+#endif /* __GNUC__ */
 
 /// @summary Bitflags that can be set on a read queue.
 enum io_rdq_flags_e
@@ -133,6 +137,7 @@ enum io_rdq_flags_e
     IO_RDQ_FLAGS_NONE               = (0 << 0), /// Prefer synchronous, buffered I/O.
     IO_RDQ_FLAGS_ASYNC              = (1 << 0), /// Prefer asynchronous I/O.
     IO_RDQ_FLAGS_UNBUFFERED         = (1 << 1), /// Prefer unbuffered I/O.
+    IO_RDQ_FLAGS_CANCEL_ALL         = (1 << 2), /// Cancel all active and pending jobs.
 };
 
 /// @summary Bitflags that can be set on io_rdq_file_t::Status.
@@ -203,11 +208,10 @@ struct io_rdq_file_t
     size_t           BytesRead;     /// The total number of bytes read so far.
     uint32_t         Status;        /// Combination of io_rdq_file_status_e.
     DWORD            OSError;       /// Any error code returned by the OS.
-    OVERLAPPED       AIO;           /// Overlapped I/O state for the current read.
     uint32_t         RangeCount;    /// The number of ranges defined for the file.
     uint32_t         RangeIndex;    /// The zero-based index of the range being read.
     io_range_t       RangeList[NR]; /// Range data, converted to (Begin, End) pairs.
-    io_returnq_t     ReturnQueue;   /// The SRSW FIFO for returning buffers from the PC.
+    io_returnq_t    *ReturnQueue;   /// The SRSW FIFO for returning buffers from the PC.
     size_t           ReturnCount;   /// The number of returns pending for this file.
     size_t           BytesTotal;    /// The total number of bytes to be read for the whole job.
     size_t           FileSize;      /// The total size of the file, in bytes.
@@ -227,12 +231,15 @@ struct io_rdq_t
 {
     uint32_t         Flags;         /// Combination of io_rdq_flags_e.
     HANDLE           Idle;          /// Manual Reset Event, signaled when idle.
+    size_t           OverflowCount; /// The number of valid items in DataOverflow.
+    io_rdop_t       *DataOverflow;  /// ActiveCount io_rdop_t that couldn't be delivered.
     io_rdstopq_t    *CancelQueue;   /// Where to look for job cancellations.
     io_rdpendq_t    *PendingQueue;  /// Where to look for new jobs.
     size_t           ActiveCapacity;/// Maximum number of files opened concurrently.
     size_t           ActiveCount;   /// Current number of files opened.
     uint32_t        *ActiveJobIds;  /// List of active job IDs; FileCount are valid.
     io_rdq_file_t   *ActiveJobList; /// List of active job state; FileCount are valid.
+    OVERLAPPED      *ActiveJobAIO;  /// List of active job async I/O state; FileCount are valid.
     HANDLE          *ActiveJobWait; /// List of active job wait handles; FileCount are valid.
     size_t const     MaxReadSize;   /// Maximum number of bytes to read per-op.
     io_rdbuffer_t    BufferManager; /// Management state for the I/O buffer pool.
@@ -687,15 +694,72 @@ static inline size_t clamp_to(size_t size, size_t limit)
     return (size > limit) ? limit : size;
 }
 
+/// @summary Redirect a call to CancelIoEx to CancelIo on systems that don't support the Ex version.
+/// @param file The handle of the file whose I/O is being cancelled.
+/// @param aio Ignored. See MSDN for CancelIoEx.
+/// @return See MSDN for CancelIo.
+static BOOL WINAPI CancelIoEx_Fallback(HANDLE file, OVERLAPPED* /*aio*/)
+{
+    return CancelIo(file);
+}
+
+/// @summary Redirect a call to GetNativeSystemInfo to GetSystemInfo.
+/// @param sys_info The SYSTEM_INFO structure to populate.
+static void WINAPI GetNativeSystemInfo_Fallback(SYSTEM_INFO *sys_info)
+{
+    GetSystemInfo(sys_info);
+}
+
+/// @summary Redirect a call to GetOverlappedResultEx to GetOverlapped result 
+/// on systems that don't support the Ex version. 
+/// @param file The file handle associated with the I/O operation.
+/// @param aio The OVERLAPPED structure representing the I/O operation.
+/// @param bytes_transferred On return, this location stores the number of bytes transferred,
+/// @param timeout Specify 0 to check the status and return immediately. Any non-zero value 
+/// will cause the call to block until status information is available.
+/// @param alertable Ignored. See MSDN for GetOverlappedResultEx.
+static BOOL WINBASEAPI GetOverlappedResultEx_Fallback(HANDLE file, OVERLAPPED *aio, DWORD *bytes_transferred, DWORD timeout, BOOL /*alertable*/)
+{
+    // for our use case, timeout will always be 0 (= don't wait).
+    return GetOverlappedResult(file, aio, bytes_transferred, timeout ? TRUE : FALSE);
+}
+
 /// @summary Redirect a call to SetProcessWorkingSetSizeEx to SetProcessWorkingSetSize
 /// on systems that don't support the Ex version.
 /// @param process A handle to the process, or GetCurrentProcess() pseudo-handle.
 /// @param minimum The minimum working set size, in bytes.
 /// @param maximum The maximum working set size, in bytes.
 /// @param flags Ignored. See MSDN for SetProcessWorkingSetSizeEx.
+/// @return See MSDN for SetProcessWorkingSetSize.
 static BOOL WINAPI SetProcessWorkingSetSizeEx_Fallback(HANDLE process, SIZE_T minimum, SIZE_T maximum, DWORD /*flags*/)
 {
     return SetProcessWorkingSetSize(process, minimum, maximum);
+}
+
+/// @summary Loads function entry points that may not be available at compile 
+/// time with some build environments.
+static void resolve_kernel_apis(void)
+{
+    if (_ResolveKernelAPIs_)
+    {   // it's a safe assumption that kernel32.dll is mapped into our process
+        // address space already, and will remain mapped for the duration of execution.
+        // note that some of these APIs are Vista/WS2008+ only, so make sure that we 
+        // have an acceptable fallback in each case to something available earlier.
+        HMODULE kernel = GetModuleHandle("kernel32.dll");
+        if (kernel != NULL)
+        {
+            CancelIoEx_Func                 = (CancelIoExFn)                 GetProcAddress(kernel, "CancelIoEx");
+            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
+            GetOverlappedResultEx_Func      = (GetOverlappedResultExFn)      GetProcAddress(kernel, "GetOverlappedResultEx");
+            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        }
+        // fallback if any of these APIs are not available.
+        if (CancelIoEx_Func                 == NULL) CancelIoEx_Func = CancelIoEx_Fallback;
+        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func = GetNativeSystemInfo_Fallback;
+        if (GetOverlappedResultEx_Func      == NULL) GetOverlappedResultEx_Func = GetOverlappedResultEx_Fallback;
+        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
+        _ResolveKernelAPIs_ = false;
+    }
 }
 
 /// @summary Performs any one-time initialization for the Windows platforms.
@@ -709,7 +773,7 @@ static bool io_time_init(void)
     static bool _InitTimerResult_  = false;
     if (_InitHighResTimer_)
     {
-        if (QueryPerformanceFrequency(&g_Frequency))
+        if (QueryPerformanceFrequency(&_Frequency_))
         {
             _InitTimerResult_  = true;
             _InitHighResTimer_ = false;
@@ -728,7 +792,7 @@ static bool io_time_init(void)
 static inline uint64_t io_timestamp(void)
 {
     LARGE_INTEGER tsc = {0};
-    LARGE_INTEGER tsf = g_Frequency;
+    LARGE_INTEGER tsf = _Frequency_;
     QueryPerformanceCounter(&tsc);
     return (SEC_TO_NANOSEC * uint64_t(tsc.QuadPart) / uint64_t(tsf.QuadPart));
 }
@@ -744,24 +808,6 @@ static inline uint64_t io_timestamp(void)
 /// @return true if the buffer space was successfully allocated.
 static bool io_create_rdbuffer(io_rdbuffer_t *rdbuf, size_t total_size, size_t alloc_size)
 {
-    static GetNativeSystemInfoFn        GetNativeSystemInfo_Func        = NULL;
-    static SetProcessWorkingSetSizeExFn SetProcessWorkingSetSizeEx_Func = NULL;
-    static bool _ResolveVistaAPIs_ = true;
-
-    if (_ResolveVistaAPIs_)
-    {
-        HMODULE kernel = GetModuleHandle("kernel32.dll");
-        if (kernel != NULL)
-        {
-            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
-            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
-        }
-        // fallback if either of these APIs are not available.
-        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func        = GetSystemInfo;
-        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
-        _ResolveVistaAPIs_ = false;
-    }
-
     SYSTEM_INFO sysinfo = {0};
     GetNativeSystemInfo_Func(&sysinfo);
     
@@ -874,6 +920,364 @@ static void io_rdbuffer_put(io_rdbuffer_t *rdbuf, void *addr)
     rdbuf->FreeList[rdbuf->FreeCount++] = addr;
 }
 
+/// @summary Allocates storage for a new return queue and initializes it to empty.
+/// @return The return queue instance, or NULL.
+static io_returnq_t* io_create_returnq(void)
+{   // return queues are explicitly allocated on the heap.
+    // there exists one return queue for each started, but non-completed job.
+    // the same return queue is used whether the job is active or waiting to finish.
+    io_returnq_t *rq = (io_returnq_t*) malloc(sizeof(io_returnq_t));
+    if (rq != NULL)
+    {
+        if (io_create_srsw_fifo(rq, IO_RDQ_MAX_RETURNS) == false)
+        {   // the necessary memory could not be allocated.
+            free(rq); rq = NULL;
+        }
+    }
+    return rq;
+}
+
+/// @summary Frees the resources associated with a return queue. Return queues
+/// are deleted at the time of job completion.
+/// @param rq The return queue to delete.
+/// @return The function always returns NULL.
+static io_returnq_t* io_delete_returnq(io_returnq_t *rq)
+{
+    if (rq != NULL)
+    {
+        io_delete_srsw_fifo(rq);
+        free(rq);
+    }
+    return NULL;
+}
+
+/// @summary Calculates statistics and posts a job result to the completion queue 
+/// for a job that was not cancelled. This function should be called only when 
+/// the job is not waiting for any more buffer returns (it is truly complete.)
+/// The caller must perform maintenence on any internal lists (Active*, Finish*).
+/// @param rdq The read queue managing the job.
+/// @param rdf The job state. The Status, BytesRead, BytesTotal, ReturnCount, 
+/// FileSize, OSError, NanosEnq, NanosDeq, and NanosEnd fields must be valid. 
+/// The file handle will be closed if it is currently open.
+/// @param id The application identifier for the job.
+static void io_complete_job(io_rdq_t *rdq, io_rdq_file_t *rdf, uint32_t id)
+{
+    if (rdf->File  != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(rdf->File);
+        rdf->File   = INVALID_HANDLE_VALUE;
+    }
+    // expectation -- rdf->ReturnCount should be zero.
+    // delete the return queue; it will not be accessed anymore.
+    rdf->ReturnQueue  = io_delete_returnq(rdf->ReturnQueue);
+
+    // get the timestamp of job competion (nnanos) and determine job status.
+    uint64_t nnanos = io_timestamp();
+    uint64_t enanos = nnanos;
+    uint32_t status = IO_STATUS_UNKNOWN;
+    if (rdf->Status & IO_RDQ_FILE_FINISHED)
+    {   // all ranges were read successfully.
+        status |= IO_STATUS_SUCCESS;
+        enanos  = rdf->NanosEnd;
+    }
+    if (rdf->Status & IO_RDQ_FILE_ERROR)
+    {   // an error was encountered. rdf->OSError is valid.
+        status |= IO_STATUS_ERROR;
+        enanos  = rdf->NanosEnd;
+    }
+    if (rdf->Status & IO_RDQ_FILE_CANCELLED)
+    {   // the job was intentionally cancelled.
+        status |= IO_STATUS_CANCELLED;
+        enanos  = rdf->NanosEnd;
+    }
+    if (rdf->Status & IO_RDQ_FILE_EOF)
+    {   // the entire contents of the file was read.
+        status |= IO_STATUS_EOF;
+        enanos  = rdf->NanosEnd;
+    }
+
+    // populate the job result and post it to the completion queue.
+    io_rdq_result_t res;
+    res.JobId       = id;
+    res.Status      = status;
+    res.OSError     = rdf->OSError;
+    res.Reserved1   = 0;
+    res.BytesTotal  = rdf->FileSize;
+    res.BytesJob    = rdf->BytesTotal;
+    res.BytesRead   = rdf->BytesRead;
+    res.NanosWait   = rdf->NanosDeq - rdf->NanosEnq;
+    res.NanosRead   = enanos - rdf->NanosDeq;
+    res.NanosTotal  = enanos - rdf->NanosEnq;
+    io_srsw_fifo_put(rdq->CompleteQueue, res);
+}
+
+/// @summary Move a single active job to the finished job list. The job status 
+/// is updated prior to calling this function. Typically, the file handle is 
+/// also closed prior to calling this function.
+/// @param rdq The read queue managing the job.
+/// @param active_index The zero-based index of the job to move from the active
+/// list to the finished list.
+/// @return true if the job was removed from the active list and moved to finished.
+static bool io_finish(io_rdq_t *rdq, size_t active_index)
+{
+    if (rdq->FinishCount   ==  rdq->FinishCapacity)
+    {   // the capacity of the finished job list needs to be increased.
+        size_t         cap  =  rdq->FinishCapacity + rdq->ActiveCapacity;
+        uint32_t      *ids  = (uint32_t*)      realloc(rdq->FinishJobIds , cap * sizeof(uint32_t));
+        io_rdq_file_t *jobs = (io_rdq_file_t*) realloc(rdq->FinishJobList, cap * sizeof(io_rdq_file_t));
+        if (ids  != NULL) rdq->FinishJobIds  = ids;
+        if (jobs != NULL) rdq->FinishJobList = jobs;
+        if (ids  != NULL && jobs != NULL) rdq->FinishCapacity = cap;
+        else return false;
+    }
+
+    // this job will not be needing any pending I/O buffer.
+    if (rdq->ActiveJobList[active_index].TargetBuffer != NULL)
+    {   // return the target buffer to the pool.
+        io_rdbuffer_put(&rdq->BufferManager, rdq->ActiveJobList[active_index].TargetBuffer);
+        rdq->ActiveJobList[active_index].TargetBuffer  = NULL;
+    }
+
+    // copy the job from the active list to the finished list.
+    size_t             finish_index  = rdq->FinishCount;
+    rdq->FinishJobIds [finish_index] = rdq->ActiveJobIds [active_index];
+    rdq->FinishJobList[finish_index] = rdq->ActiveJobList[active_index];
+    rdq->FinishCount++;
+
+    // remove the job from the active list, swapping the last active job 
+    // into its place (the active_index slot.) note that we can be sure 
+    // that since this is called from io_rdq_poll(), we are *NOT* actively
+    // waiting on anything in rdq->ActiveJobWait, so it's safe to modify.
+    size_t last_active  = rdq->ActiveCount - 1;
+    if    (last_active != active_index)
+    {
+        rdq->ActiveJobIds [active_index] = rdq->ActiveJobIds [last_active];
+        rdq->ActiveJobList[active_index] = rdq->ActiveJobList[last_active];
+        rdq->ActiveJobAIO [active_index] = rdq->ActiveJobAIO [last_active];
+        rdq->ActiveJobWait[active_index] = rdq->ActiveJobWait[last_active];
+    }
+    // @note: io_cull_finished_jobs(), which calls this function, decrements
+    // rdq->ActiveCount if this function returns true, but not if it returns false.
+    return true;
+}
+
+/// @summary Go through the list of active jobs, looking for any with a 
+/// closed file handle, and move them to the finished list.
+/// @param rdq The read queue to update.
+static void io_cull_finished_jobs(io_rdq_t *rdq)
+{
+    for (size_t i = 0; i < rdq->ActiveCount; /* empty */)
+    {
+        if (rdq->ActiveJobList[i].File == INVALID_HANDLE_VALUE)
+        {
+            if (io_finish(rdq, i))
+            {   // this job has been moved to the finished list.
+                // it will be further inspected during io_finish_jobs().
+                rdq->ActiveCount--;
+            }
+            else ++i; // memory allocation failed. hold the slot for now.
+        }
+        else ++i; // this job is still active.
+    }
+}
+
+/// @summary Go through the list of finished jobs, looking for any with a 
+/// pending return count of zero. Complete those jobs, and then remove them
+/// from the set of finished jobs.
+/// @param rdq The read queue to update.
+static void io_finish_jobs(io_rdq_t *rdq)
+{
+    for (size_t i = 0; i < rdq->FinishCount; /* empty */)
+    {
+        if (rdq->FinishJobList[i].ReturnCount == 0)
+        {   // move the job to the completion queue, and then swap the job at
+            // the end of the finish list into the place of the finished job.
+            io_complete_job(rdq, &rdq->FinishJobList[i], rdq->FinishJobIds[i]);
+
+            if (i + 1 != rdq->FinishCount)
+            {
+                size_t last = rdq->FinishCount - 1;
+                rdq->FinishJobIds [i] = rdq->FinishJobIds [last];
+                rdq->FinishJobList[i] = rdq->FinishJobList[last];
+            }
+            rdq->FinishCount--;  // the FinishCount is decremented, but i 
+            // is not incremented, since we need to check the job we just
+            // swapped into slot i.
+        }
+        else ++i;  // this job is still waiting on buffer returns.
+    }
+    size_t nactive  = rdq->ActiveCount + rdq->FinishCount;
+    size_t npending = io_srsw_fifo_count(rdq->PendingQueue);
+    if (nactive + npending == 0)
+        SetEvent(rdq->Idle);
+}
+
+/// @summary Processes all pending cancellations against a read queue.
+/// @param rdq The read queue being updated.
+static void io_process_cancellations(io_rdq_t *rdq)
+{
+    bool did_signal_idle  = false;
+    if (rdq->Flags & IO_RDQ_FLAGS_CANCEL_ALL)
+    {
+        // the only potential change to flags that could be made outside of 
+        // the io_rdq_poll() call is to set the cancel all status, which 
+        // would not happen, since we're processing that now. clear the status.
+        uintptr_t flags_addr  = (uintptr_t)&rdq->Flags;
+        uint32_t  new_flags   = rdq->Flags & ~IO_RDQ_FLAGS_CANCEL_ALL;
+        io_atomic_write_uint32_aligned(flags_addr, new_flags);
+        
+        // move jobs from pending to completed.
+        uint32_t const npending = io_srsw_fifo_count(rdq->PendingQueue);
+        for (size_t  i = 0; i < npending; ++i)
+        {
+            io_rdq_job_t job;
+            if (io_srsw_fifo_get(rdq->PendingQueue, job))
+            {   // immediately complete this job.
+                io_rdq_file_t rdf;
+                rdf.File         = INVALID_HANDLE_VALUE;
+                rdf.TargetBuffer = NULL;
+                rdf.SectorSize   = 0;
+                rdf.BytesRead    = 0;
+                rdf.Status       = IO_RDQ_FILE_CANCELLED;
+                rdf.OSError      = ERROR_SUCCESS;
+                rdf.RangeCount   = job.RangeCount;
+                rdf.RangeIndex   = 0;
+                rdf.ReturnQueue  = NULL;
+                rdf.ReturnCount  = 0;
+                rdf.BytesTotal   = 0;
+                rdf.FileSize     = 0;
+                rdf.NanosEnq     = job.EnqueueTime;
+                rdf.NanosDeq     = io_timestamp();
+                rdf.NanosEnd     = rdf.NanosDeq;
+                for (size_t i = 0;  i < job.RangeCount; ++i)
+                {   // do calculate an accurate total job bytes count.
+                    rdf.BytesTotal   += job.RangeList[i].Offset + job.RangeList[i].Amount;
+                }   // if there are no jobs, the BytesTotal remains 0.
+                io_complete_job(rdq, &rdf, job.JobId);
+            }
+        }
+
+        // cancel all active jobs. these must go through the transition 
+        // from active->finish and finish->completed. jobs with pending 
+        // buffer returns will remain in the finish list.
+        size_t const nactive = rdq->ActiveCount;
+        for (size_t i = 0; i < nactive; ++i)
+        {
+            io_rdq_file_t  &rdf = rdq->ActiveJobList[i];
+            if (rdf.Status & IO_RDQ_FILE_PENDING_AIO)
+            {   // cancel pending AIO and block until it's done.
+                DWORD nbt = 0;
+                CancelIoEx_Func(rdf.File, &rdq->ActiveJobAIO[i]);
+                GetOverlappedResult(rdf.File, &rdq->ActiveJobAIO[i], &nbt, TRUE);
+            }
+            CloseHandle(rdf.File);
+            rdf.File      = INVALID_HANDLE_VALUE;
+            rdf.Status   |= IO_RDQ_FILE_CANCELLED;
+            rdf.NanosEnd  = io_timestamp();
+        }
+        io_cull_finished_jobs(rdq);
+        io_finish_jobs(rdq);
+
+        // flush all pending overflows and return their associated buffers.
+        size_t const noverflow = rdq->OverflowCount;
+        for (size_t  i = 0;  i < noverflow; ++i)
+        {
+            io_rdbuffer_put(&rdq->BufferManager, rdq->DataOverflow[i].DataBuffer);
+        }
+        rdq->OverflowCount = 0;
+
+        // at this point, all we might have remaining is jobs waiting on 
+        // buffers to be returned. signal that we are idle if necessary.
+        if (rdq->FinishCount == 0)
+        {
+            did_signal_idle = true;
+            SetEvent(rdq->Idle);
+        }
+    }
+
+    // process the cancellation queue. any items to be cancelled here may 
+    // have the cancellation completed asynchronously, if they have pending AIO.
+    uint32_t const ncancel = io_srsw_fifo_count(rdq->CancelQueue);
+    for (size_t  i = 0;  i < ncancel; ++i)
+    {
+        uint32_t id;
+        if (io_srsw_fifo_get(rdq->CancelQueue, id))
+        {   // find this job in the active job list.
+            size_t const nactive = rdq->ActiveCount;
+            uint32_t const  *ids = rdq->ActiveJobIds;
+            for (size_t j = 0; j < nactive; ++j)
+            {
+                if (ids[j] == id)
+                {
+                    io_rdq_file_t &rdf = rdq->ActiveJobList[j];
+                    OVERLAPPED    *aio =&rdq->ActiveJobAIO [j];
+                    if (rdf.Status & IO_RDQ_FILE_PENDING_AIO)
+                    {   // cancel the pending I/O, but don't wait for it to 
+                        // finish. the completion will be picked up on a later
+                        // poll cycle. the file handle needs to remain open.
+                        CancelIoEx_Func(rdf.File, aio);
+                    }
+                    else
+                    {   // synchronous I/O, or no pending AIO, can be cancelled
+                        // and completed immediately. close the file handle.
+                        CloseHandle(rdf.File);
+                        rdf.File     = INVALID_HANDLE_VALUE;
+                        rdf.NanosEnd = io_timestamp();
+                    }
+                    if (rdq->OverflowCount)
+                    {   // flush any pending overflow for the cancelled item.
+                        for (size_t k = 0; k < rdq->OverflowCount; ++k)
+                        {
+                            if (rdq->DataOverflow[k].DataBuffer == rdf.TargetBuffer)
+                            {   // swap the last overflow into slot 'k'.
+                                rdq->DataOverflow[k] = rdq->DataOverflow[--rdq->OverflowCount];
+                                rdf.ReturnCount--;
+                                break;
+                            }
+                        }
+                    }
+                    rdf.Status |= IO_RDQ_FILE_CANCELLED;
+                    break;
+                }
+            }
+        }
+    }
+
+    // move any cancelled jobs from active to finish, and then 
+    // complete any finished jobs. jobs pending buffer returns 
+    // remain in the finished list.
+    io_cull_finished_jobs(rdq);
+    io_finish_jobs(rdq);
+
+    // signal the idle event if there are no active or pending
+    // jobs, and we didn't signal the event processing cancel all.
+    size_t nactive  = rdq->ActiveCount + rdq->FinishCount;
+    size_t npending = io_srsw_fifo_count(rdq->PendingQueue);
+    if (nactive + npending == 0 && !did_signal_idle)
+        SetEvent(rdq->Idle);
+}
+
+/// @summary Attempts to publish any overflow data buffers to the data queue. 
+/// The poll cycle cannot execute anything except for cancel operations until
+/// all overflow operations have been dispatched to the data queue.
+/// @param rdq The read queue to flush.
+/// @return The number of unqueued read operations remaining.
+static size_t io_flush_overflow(io_rdq_t *rdq)
+{
+    while (rdq->OverflowCount > 0)
+    {
+        if (io_srsw_fifo_put(rdq->DataQueue, rdq->DataOverflow[0]))
+        {   // swap the last item in the overflow list into slot 0.
+            // there can't be more than one pending read per active file,
+            // so reads will still complete in order as we can't start 
+            // the next read until the overflow read has been queued.
+            rdq->DataOverflow[0] = rdq->DataOverflow[--rdq->OverflowCount];
+        }
+        else break; // the queue is full; no point in continuing.
+    }
+    return rdq->OverflowCount;
+}
+
 /// @summary Prepares an active job, opening the file, setting timestamps, etc.
 /// @param rdq The read queue managing the job.
 /// @param rdf The job state data to modify.
@@ -927,6 +1331,14 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
         }
     }
 
+    // create a new FIFO for buffer returns from the processing coordinator.
+    io_returnq_t *returnq = io_create_returnq();
+    if (returnq == NULL)
+    {   // a return queue is required for correct functioning.
+        CloseHandle(file);
+        return false;
+    }
+
     // everything looks good, so initialize the state.
     rdf->File             = file;
     rdf->TargetBuffer     = NULL;
@@ -934,19 +1346,15 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     rdf->BytesRead        = 0;
     rdf->Status           = IO_RDQ_FILE_NONE;
     rdf->OSError          = ERROR_SUCCESS;
-    rdf->AIO.Internal     = 0;
-    rdf->AIO.InternalHigh = 0;
-    rdf->AIO.Offset       = 0;
-    rdf->AIO.OffsetHigh   = 0;
     rdf->RangeCount       = job.RangeCount;
     rdf->RangeIndex       = 0;
+    rdf->ReturnQueue      = returnq;
     rdf->ReturnCount      = 0;
     rdf->BytesTotal       = 0;
     rdf->FileSize         = fsize;
     rdf->NanosEnq         = job.EnqueueTime;
     rdf->NanosDeq         = io_timestamp();
     rdf->NanosEnd         = 0;
-    io_create_srsw_fifo(&rdf->ReturnQueue, IO_RDQ_MAX_RETURNS);
     for (size_t i = 0;  i < job.RangeCount; ++i)
     {   // convert ranges to (Begin, End) and calculate total number of bytes to read.
         rdf->RangeList[i].Offset = job.RangeList[i].Offset;
@@ -962,67 +1370,290 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     return true;
 }
 
-/// @summary Calculates statistics and posts a job result to the completion queue 
-/// for a job that was not cancelled. This function should be called only when 
-/// the job is not waiting for any more buffer returns (it is truly complete.)
-/// The caller must perform maintenence on any internal lists (Active*, Finish*).
-/// @param rdq The read queue managing the job.
-/// @param rdf The job state. The Status, BytesRead, BytesTotal, ReturnCount, 
-/// FileSize, OSError, NanosEnq, NanosDeq, and NanosEnd fields must be valid. 
-/// The file handle will be closed if it is currently open.
-/// @param id The application identifier for the job.
-static void io_complete_job(io_rdq_t *rdq, io_rdq_file_t *rdf, uint32_t id)
+/// @summary Implements the I/O update and schedule loop for synchronous I/O.
+/// This is where we actually read data into target buffers, close files, and 
+/// publish read operations to the read list.
+/// @param rdq The I/O read queue being polled.
+static void io_rdq_poll_sync(io_rdq_t *rdq)
 {
-    // expectation -- rdf->ReturnCount should be zero.
-    if (rdf->File  != INVALID_HANDLE_VALUE)
+    size_t const  mbread = rdq->BufferManager.AllocSize; // max bytes to read
+    size_t const  nfiles = rdq->ActiveCount;
+    for (size_t i = 0; i < nfiles; ++i)
     {
-        CloseHandle(rdf->File);
-        rdf->File   = INVALID_HANDLE_VALUE;
-    }
+        io_rdq_file_t &rdf = rdq->ActiveJobList[i];
+        io_range_t    &rng = rdf.RangeList[rdf.RangeIndex];
+        DWORD          amt = rng.Amount - rng.Offset;
+        DWORD          nbt = 0;
+        BOOL           res = FALSE;
 
-    // get the timestamp of job competion (nnanos) and determine job status.
-    uint64_t nnanos = io_timestamp();
-    uint64_t enanos = nnanos;
-    uint32_t status = IO_STATUS_UNKNOWN;
-    if (rdf->Status & IO_RDQ_FILE_FINISHED)
-    {   // all ranges were read successfully.
-        status |= IO_STATUS_SUCCESS;
-        enanos  = rdf->NanosEnd;
-    }
-    if (rdf->Status & IO_RDQ_FILE_ERROR)
-    {   // an error was encountered. rdf->OSError is valid.
-        status |= IO_STATUS_ERROR;
-    }
-    if (rdf->Status & IO_RDQ_FILE_CANCELLED)
-    {   // the job was intentionally cancelled.
-        status |= IO_STATUS_CANCELLED;
-    }
-    if (rdf->Status & IO_RDQ_FILE_EOF)
-    {   // the entire contents of the file was read.
-        status |= IO_STATUS_EOF;
-    }
+        if (rdq->Flags & IO_RDQ_FLAGS_UNBUFFERED)
+        {   // unbuffered I/O must be performed in multiples of the sector size.
+            // otherwise, there are no restrictions on the amount being read.
+            amt = (DWORD) align_up(amt, rdf.SectorSize);
+        }
 
-    // populate the job result and post it to the completion queue.
-    io_rdq_result_t res;
-    res.JobId       = id;
-    res.Status      = status;
-    res.OSError     = rdf->OSError;
-    res.Reserved1   = 0;
-    res.BytesTotal  = rdf->FileSize;
-    res.BytesJob    = rdf->BytesTotal;
-    res.BytesRead   = rdf->BytesRead;
-    res.NanosWait   = rdf->NanosDeq - rdf->NanosEnq;
-    res.NanosRead   = enanos - rdf->NanosDeq;
-    res.NanosTotal  = enanos - rdf->NanosEnq;
-    io_srsw_fifo_put(rdq->CompleteQueue, res);
+        // clamp the read amount to the buffer size.
+        amt = (DWORD) clamp_to(amt, mbread);
+        rdf.TargetBuffer  = io_rdbuffer_get(&rdq->BufferManager);
+        if (rdf.TargetBuffer == NULL)
+        {   // no buffers are available right now. try again next poll.
+            continue;
+        }
+
+        // schedule the next read and possibly complete.
+        res = ReadFile(rdf.File, rdf.TargetBuffer, amt, &nbt, NULL);
+        if (res && nbt > 0)
+        {   // nbt bytes of data was read from the file.
+            io_rdop_t rop;
+            rop.Id           = rdq->ActiveJobIds[i];
+            rop.DataAmount   = nbt;
+            rop.DataBuffer   = rdf.TargetBuffer;
+            rop.ReturnQueue  = rdf.ReturnQueue;
+            rop.FileOffset   = rng.Offset;
+            rdf.BytesRead   += nbt;
+            rng.Offset      += nbt;
+            if (rng.Offset  >= rng.Amount)
+            {   // this range has been fully processed.
+                // unbuffered I/O might read more data than required.
+                rdf.RangeIndex++;
+            }
+            if (rdf.RangeIndex == rdf.RangeCount)
+            {   // we've finished reading data for this file.
+                CloseHandle(rdf.File);
+                rdf.File      = INVALID_HANDLE_VALUE;
+                rdf.Status    = IO_RDQ_FILE_FINISHED;
+                rdf.NanosEnd  = io_timestamp();
+            }
+            // post the successful read to the data queue.
+            if (io_srsw_fifo_put(rdq->DataQueue, rop))
+            {   // the read operation was successfully enqueued.
+                rdf.ReturnCount++;
+            }
+            else
+            {   // the data queue is full. try again at the start of the next 
+                // io_rdq_poll() cycle. this causes a hard stall. the return 
+                // count is incremented in anticipation of successful enqueue.
+                rdq->DataOverflow[rdq->OverflowCount++] = rop;
+                rdf.ReturnCount++;
+            }
+        }
+        else
+        {   // an error has occurred, or EOF was reached.
+            DWORD err = GetLastError();
+            if (err  == ERROR_SUCCESS || err == ERROR_HANDLE_EOF)
+            {   // end of file was reached.
+                rdf.Status  |= IO_RDQ_FILE_FINISHED | IO_RDQ_FILE_EOF;
+                rdf.NanosEnd = io_timestamp();
+            }
+            else
+            {   // an actual error has occurred.
+                rdf.Status  |= IO_RDQ_FILE_ERROR;
+                rdf.OSError  = err;
+                rdf.NanosEnd = io_timestamp();
+            }
+            CloseHandle(rdf.File);
+            rdf.File = INVALID_HANDLE_VALUE;
+        }
+    }
 }
 
-// io_poll_rdq(...)
-// 1. process all items in the cancellation queue
-// 2. while rdq->ActiveCount < rdq->ActiveCapacity, pop from pending queue
-// 3. poll state of all pending I/Os, schedule next I/Os, etc.
-// 4. move jobs from active->finish
-// 5. move jobs from finish->complete
+/// @summary Implements the I/O poll and schedule loop for asynchronous I/O queues.
+/// This is where we actually read data into target buffers, close files, and 
+/// publish read operations to the read list.
+/// @param rdq The I/O read queue being polled.
+static void io_rdq_poll_async(io_rdq_t *rdq)
+{
+    size_t const  mbread = rdq->BufferManager.AllocSize; // max bytes to read
+    size_t const  nfiles = rdq->ActiveCount;
+    for (size_t i = 0; i < nfiles; ++i)
+    {
+        io_rdq_file_t &rdf = rdq->ActiveJobList[i];
+        OVERLAPPED    *aio =&rdq->ActiveJobAIO [i];
+        DWORD          err = ERROR_SUCCESS;
+        DWORD          nbt = 0;
+        BOOL           res = FALSE;
+        bool   schedule_io = false;
+
+        if (rdf.Status & IO_RDQ_FILE_PENDING_AIO)
+        {   // poll the status of the active read against this file.
+            // specify a wait of zero so that we just poll instead of wait.
+            res = GetOverlappedResultEx_Func(rdf.File, aio, &nbt, 0, TRUE);
+            if (res && nbt > 0)
+            {   // the read operation has completed successfully.
+                io_rdop_t   rop;
+                io_range_t &rng  = rdf.RangeList[rdf.RangeIndex];
+                rop.Id           = rdq->ActiveJobIds[i];
+                rop.DataAmount   = nbt;
+                rop.DataBuffer   = rdf.TargetBuffer;
+                rop.ReturnQueue  = rdf.ReturnQueue;
+                rop.FileOffset   = rng.Offset;
+                rdf.BytesRead   += nbt;
+                rng.Offset      += nbt;
+                if (rng.Offset  >= rng.Amount)
+                {   // this range has been fully processed.
+                    // unbuffered I/O might read more data than required.
+                    rdf.RangeIndex++;
+                }
+                if (rdf.RangeIndex == rdf.RangeCount)
+                {   // we've finished reading data for this file.
+                    CloseHandle(rdf.File);
+                    rdf.File      = INVALID_HANDLE_VALUE;
+                    rdf.Status    = IO_RDQ_FILE_FINISHED;
+                    rdf.NanosEnd  = io_timestamp();
+                    schedule_io   = false;
+                }
+                else schedule_io  = true;
+
+                // post the successful read to the data queue.
+                if (io_srsw_fifo_put(rdq->DataQueue, rop))
+                {   // the read operation was successfully enqueued.
+                    rdf.ReturnCount++;
+                }
+                else
+                {   // the data queue is full. try again at the start of the next 
+                    // io_rdq_poll() cycle. this causes a hard stall. the return 
+                    // count is incremented in anticipation of successful enqueue.
+                    rdq->DataOverflow[rdq->OverflowCount++] = rop;
+                    rdf.ReturnCount++;
+                }
+
+                // clear the AIO pending status; the next I/O might complete 
+                // synchronously for all we know...
+                rdf.Status &= ~IO_RDQ_FILE_PENDING_AIO;
+            }
+            else
+            {
+                if ((err = GetLastError()) == ERROR_IO_INCOMPLETE)
+                {   // the read operation is still in-progress; no error.
+                    schedule_io = false;
+                }
+                else if (err == ERROR_OPERATION_ABORTED)
+                {   // the entire job was aborted. clean up.
+                    CloseHandle(rdf.File);
+                    rdf.File      = INVALID_HANDLE_VALUE;
+                    rdf.Status   |= IO_RDQ_FILE_CANCELLED;
+                    rdf.NanosEnd  = io_timestamp();
+                    schedule_io   = false;
+                }
+                else if (err == ERROR_HANDLE_EOF)
+                {   // end-of-file was reached. clean up.
+                    CloseHandle(rdf.File);
+                    rdf.File     = INVALID_HANDLE_VALUE;
+                    rdf.Status  |= IO_RDQ_FILE_FINISHED | IO_RDQ_FILE_EOF;
+                    rdf.NanosEnd = io_timestamp();
+                    schedule_io  = false;
+                }
+                else
+                {   // an error occurred while processing the request.
+                    CloseHandle(rdf.File);
+                    rdf.File     = INVALID_HANDLE_VALUE;
+                    rdf.Status  |= IO_RDQ_FILE_ERROR;
+                    rdf.OSError  = err;
+                    rdf.NanosEnd = io_timestamp();
+                    schedule_io  = false;
+                }
+            }
+        }
+        else
+        {   // the previous read operation completed synchronously.
+            // there is no outstanding read operation, so schedule one.
+            schedule_io = true;
+        }
+
+        if (schedule_io)
+        {   // schedule the next I/O operation. we need to be careful because
+            // the I/O operation could actually complete synchronously. see:
+            // 'Asynchronous Disk I/O Appears as Synchronous' located at 
+            // http://support.microsoft.com/kb/156932
+            io_range_t &rng = rdf.RangeList[rdf.RangeIndex];
+            DWORD       amt = rng.Amount - rng.Offset;
+            BOOL        res = FALSE;
+
+            if (rdq->Flags & IO_RDQ_FLAGS_UNBUFFERED)
+            {   // unbuffered I/O must be performed in multiples of the sector size.
+                // otherwise, there are no restrictions on the amount being read.
+                amt = (DWORD) align_up(amt, rdf.SectorSize);
+            }
+
+            // clamp the read amount to the buffer size.
+            amt = (DWORD) clamp_to(amt, mbread);
+            rdf.TargetBuffer  = io_rdbuffer_get(&rdq->BufferManager);
+            if (rdf.TargetBuffer == NULL)
+            {   // no buffers are available right now. try again next poll.
+                continue;
+            }
+
+            // set up the OVERLAPPED structure for the request.
+            aio->Internal     = 0;
+            aio->InternalHigh = 0;
+            aio->Offset       = uint32_t((rng.Offset & 0x00000000FFFFFFFFULL) >>  0);
+            aio->OffsetHigh   = uint32_t((rng.Offset & 0xFFFFFFFF00000000ULL) >> 32);
+
+            // submit the read. this may complete synchronously or asynchronously.
+            res = ReadFile(rdf.File, rdf.TargetBuffer, amt, &nbt, aio);
+            if (res && nbt  > 0)
+            {   // the read operation completed synchronously.
+                io_rdop_t rop;
+                rop.Id           = rdq->ActiveJobIds[i];
+                rop.DataAmount   = nbt;
+                rop.DataBuffer   = rdf.TargetBuffer;
+                rop.ReturnQueue  = rdf.ReturnQueue;
+                rop.FileOffset   = rng.Offset;
+                rdf.BytesRead   += nbt;
+                rng.Offset      += nbt;
+                if (rng.Offset  >= rng.Amount)
+                {   // this range has been fully processed.
+                    // unbuffered I/O might read more data than required.
+                    rdf.RangeIndex++;
+                }
+                if (rdf.RangeIndex == rdf.RangeCount)
+                {   // we've finished reading data for this file.
+                    CloseHandle(rdf.File);
+                    rdf.File      = INVALID_HANDLE_VALUE;
+                    rdf.Status    = IO_RDQ_FILE_FINISHED;
+                    rdf.NanosEnd  = io_timestamp();
+                }
+                // post the successful read to the data queue.
+                if (io_srsw_fifo_put(rdq->DataQueue, rop))
+                {   // the read operation was successfully enqueued.
+                    rdf.ReturnCount++;
+                }
+                else
+                {   // the data queue is full. try again at the start of the next 
+                    // io_rdq_poll() cycle. this causes a hard stall. the return 
+                    // count is incremented in anticipation of successful enqueue.
+                    rdq->DataOverflow[rdq->OverflowCount++] = rop;
+                    rdf.ReturnCount++;
+                }
+
+                // don't try and poll the status on the next update.
+                rdf.Status &= ~IO_RDQ_FILE_PENDING_AIO;
+            }
+            else
+            {   // either an error occurred, or the read operation was queued.
+                if ((err = GetLastError()) == ERROR_IO_PENDING)
+                {   // the request will be completed asynchronously.
+                    rdf.Status  |= IO_RDQ_FILE_PENDING_AIO;
+                }
+                else if (err == ERROR_HANDLE_EOF)
+                {   // end-of-file was reached. clean up.
+                    CloseHandle(rdf.File);
+                    rdf.File     = INVALID_HANDLE_VALUE;
+                    rdf.Status  |= IO_RDQ_FILE_FINISHED | IO_RDQ_FILE_EOF;
+                    rdf.NanosEnd = io_timestamp();
+                }
+                else
+                {   // an error occurred while processing the request.
+                    CloseHandle(rdf.File);
+                    rdf.File     = INVALID_HANDLE_VALUE;
+                    rdf.Status  |= IO_RDQ_FILE_ERROR;
+                    rdf.OSError  = err;
+                    rdf.NanosEnd = io_timestamp();
+                }
+            }
+        }
+    }
+}
 
 /*////////////////////////
 //   Public Functions   //
@@ -1095,4 +1726,20 @@ bool LLCALL_C io_enumerate_files(io_file_list_t *dest, char const *path, char co
     free(pathbuf);
     return false;
 }
+
+/*
+    if (_ResolveVistaAPIs_)
+    {
+        HMODULE kernel = GetModuleHandle("kernel32.dll");
+        if (kernel != NULL)
+        {
+            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
+            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+        }
+        // fallback if either of these APIs are not available.
+        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func        = GetSystemInfo;
+        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
+        _ResolveVistaAPIs_ = false;
+    }
+*/
 
