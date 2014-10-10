@@ -352,6 +352,12 @@ IO_C_API(bool) io_completionq_wait_not_full(io_rddoneq_t *doneq, uint32_t timeou
 /// whether the queue is empty after this function returns.
 IO_C_API(bool) io_completionq_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeout_ms);
 
+/// @summary Retrieve the next waiting job result from a completion queue.
+/// @param doneq The completion queue to poll.
+/// @param result The job result to populate.
+/// @return true if an item was retrieved from the queue.
+IO_C_API(bool) io_completionq_get(io_rddoneq_t *doneq, io_rdq_result_t &result);
+
 /// @summary Creates a new job cancellation queue with the specified capacity.
 /// @param capacity The maximum number of pending job cancellations.
 /// @return The new cancellation queue, or NULL.
@@ -379,6 +385,12 @@ IO_C_API(void) io_delete_dataq(io_rdopq_t *opq);
 /// timeout interval elapsed or an error occurred during the wait. Always check
 /// whether the queue is empty after this function returns.
 IO_C_API(bool) io_dataq_wait_not_empty(io_rdopq_t *opq, uint32_t timeout_ms);
+
+/// @summary Retrieve the next waiting data buffer from a data queue.
+/// @param opq The data buffer queue to poll.
+/// @param op The description of the completed I/O operation to populate.
+/// @return true if an item was retrieved from the queue.
+IO_C_API(bool) io_dataq_get(io_rdopq_t *opq, io_rdop_t &op);
 
 /// @summary Allocates resources for and initializes a concurrent read queue.
 /// @param config Options used to specify the queue behavior. This structure 

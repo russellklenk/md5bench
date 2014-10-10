@@ -1,6 +1,5 @@
 /*/////////////////////////////////////////////////////////////////////////////
-/// @summary The MD5 reference implementation. The original source is at:
-/// https://www.ietf.org/rfc/rfc1321.txt.
+/// @summary Implements the entry point of the benchmark application.
 ///////////////////////////////////////////////////////////////////////////80*/
 
 /*////////////////
@@ -164,6 +163,113 @@ static int test_md5_file(FILE *fp, char const *path)
     return EXIT_SUCCESS;
 }
 
+static void test_io_sync_seq(FILE *fp, char const *path)
+{
+    io_file_list_t files;
+    io_create_file_list(&files, 0, 0);
+    io_enumerate_files (&files, path, "*.*", true);
+
+    // create and initialize a concurrent read queue and all supporting queues.
+    io_rdpendq_t *jobq    = io_create_jobq(files.PathCount);
+    io_rdopq_t   *dataq   = io_create_dataq(512);
+    io_rdstopq_t *cancelq = io_create_cancelq(10);
+    io_rddoneq_t *finishq = io_create_completionq(files.PathCount);
+
+    io_rdq_config_t qconf;
+    qconf.DataQueue       = dataq;
+    qconf.PendingQueue    = jobq;
+    qconf.CancelQueue     = cancelq;
+    qconf.CompleteQueue   = finishq;
+    qconf.MaxConcurrent   = 1;
+    qconf.MaxBufferSize   = 16 * 1024 * 1024; // 16MB
+    qconf.MaxReadSize     = IO_ONE_PAGE;
+    qconf.Unbuffered      = false;
+    qconf.Asynchronous    = false;
+    io_rdq_t *rdq = io_create_rdq(qconf);
+
+    size_t pend_count = files.PathCount;
+    size_t jobs_count = files.PathCount;
+    size_t done_count = 0;
+    uint32_t max_wait = 16; // in milliseconds
+
+    struct app_job_t
+    {
+        uint32_t Id;
+        uint64_t Checksum;
+    };
+
+    app_job_t *job_list = (app_job_t*) malloc(jobs_count * sizeof(app_job_t));
+    uint64_t   total_nb = 0;
+    uint64_t   begin_tm = time_service_read();
+
+    while (done_count < jobs_count)
+    {
+        // block here until we can submit a job to be processed.
+        // todo: in order to do this single-threaded when we have 
+        // more jobs than we have pending queue capacity, we need 
+        // to be able to poll, ie. io_jobq_poll_not_full(jobq).
+
+        // fill up as many slots in the job queue as we can.
+        while (pend_count > 0)
+        {
+            io_rdq_job_t job;
+            job.JobId       = uint32_t(jobs_count - pend_count);
+            job.Path        = io_file_list_path(&files, job.JobId);
+            job.EnqueueTime = 0;
+            job.RangeCount  = 0;
+            if (io_rdq_submit(rdq, job) == false)
+            {   // the pending jobs queue is full.
+                break;
+            }
+            // initialize our internal state for the job we just submitted.
+            job_list[job.JobId].Id = job.JobId;
+            job_list[job.JobId].Checksum = 0;
+            pend_count--;
+        }
+
+        // block indefinitely until an I/O has completed.
+        //if (io_rdq_wait_io(rdq, IO_WAIT_FOREVER))
+        //{
+            io_rdq_poll(rdq);
+        //}
+
+        // process any data returned by the I/O manager.
+        io_rdop_t read;
+        while (io_dataq_get(dataq, read))
+        {
+            app_job_t &job   = job_list[read.Id];
+            uint8_t   *bytes = (uint8_t*) read.DataBuffer;
+            for (size_t i = 0; i < read.DataAmount; ++i)
+            {
+                job.Checksum += *bytes++;
+            }
+            io_return_buffer(read.ReturnQueue, read.DataBuffer);
+        }
+
+        // process any jobs completed by the I/O manager.
+        io_rdq_result_t result;
+        while (io_completionq_get(finishq, result))
+        {
+            total_nb += result.BytesJob;
+            done_count++;
+        }
+    }
+
+    uint64_t end_tm = time_service_read();
+    uint64_t d = duration(begin_tm, end_tm);
+    double sec = seconds(d);
+
+    printf("I/O synchronous/sequential/1 took %f seconds (%fMB/sec.)\n", sec, (total_nb/(1024*1024)) / sec);
+    
+    free(job_list);
+    io_delete_rdq(rdq);
+    io_delete_completionq(finishq);
+    io_delete_cancelq(cancelq);
+    io_delete_dataq(dataq);
+    io_delete_jobq(jobq);
+    io_delete_file_list(&files);
+}
+
 /*////////////////////////
 //   Public Functions   //
 ////////////////////////*/
@@ -190,7 +296,7 @@ int main(int argc, char **argv)
     io_file_list_t files;
     io_create_file_list(&files, 0, 0);
     io_enumerate_files (&files, "D:\\workspace", "*.*", true);
-    io_format_file_list(stdout, &files);
+    //io_format_file_list(stdout, &files);
     if (io_verify_file_list(&files))
     {
         printf("The file list verifies.\n");
@@ -200,6 +306,8 @@ int main(int argc, char **argv)
         printf("The file list contains collisions.\n");
     }
     io_delete_file_list(&files);
+
+    test_io_sync_seq(stdout, "D:\\ArcVolsR10Stage");
 
     time_service_close();
     exit(exit_code);

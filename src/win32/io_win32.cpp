@@ -1043,11 +1043,13 @@ static bool io_finish(io_rdq_t *rdq, size_t active_index)
     }
 
     // this job will not be needing any pending I/O buffer.
-    if (rdq->ActiveJobList[active_index].TargetBuffer != NULL)
+    // @todo: this should not be done for normal jobs. should it 
+    // be done for cancelled jobs? investigate.
+    /*if (rdq->ActiveJobList[active_index].TargetBuffer != NULL)
     {   // return the target buffer to the pool.
         io_rdbuffer_put(&rdq->BufferManager, rdq->ActiveJobList[active_index].TargetBuffer);
         rdq->ActiveJobList[active_index].TargetBuffer  = NULL;
-    }
+    }*/
 
     // copy the job from the active list to the finished list.
     size_t             finish_index  = rdq->FinishCount;
@@ -1075,7 +1077,7 @@ static bool io_finish(io_rdq_t *rdq, size_t active_index)
 /// @summary Go through the list of active jobs, looking for any with a 
 /// closed file handle, and move them to the finished list.
 /// @param rdq The read queue to update.
-static void io_cull_finished_jobs(io_rdq_t *rdq)
+static void io_cull_active_jobs(io_rdq_t *rdq)
 {
     for (size_t i = 0; i < rdq->ActiveCount; /* empty */)
     {   // process any pending buffer returns.
@@ -1100,7 +1102,8 @@ static void io_cull_finished_jobs(io_rdq_t *rdq)
 static void io_finish_jobs(io_rdq_t *rdq)
 {
     for (size_t i = 0; i < rdq->FinishCount; /* empty */)
-    {
+    {   // process any pending buffer returns.
+        io_process_returns(rdq, &rdq->FinishJobList[i]);
         if (rdq->FinishJobList[i].ReturnCount == 0)
         {   // move the job to the completion queue, and then swap the job at
             // the end of the finish list into the place of the finished job.
@@ -1187,7 +1190,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
             rdf.Status   |= IO_RDQ_FILE_CANCELLED;
             rdf.NanosEnd  = io_timestamp();
         }
-        io_cull_finished_jobs(rdq);
+        io_cull_active_jobs(rdq);
         io_finish_jobs(rdq);
 
         // flush all pending overflows and return their associated buffers.
@@ -1258,7 +1261,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
     // move any cancelled jobs from active to finish, and then 
     // complete any finished jobs. jobs pending buffer returns 
     // remain in the finished list.
-    io_cull_finished_jobs(rdq);
+    io_cull_active_jobs(rdq);
     io_finish_jobs(rdq);
 
     // signal the idle event if there are no active or pending
@@ -1382,6 +1385,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
         rdf->RangeList[0].Offset = 0;
         rdf->RangeList[0].Amount = fsize;
         rdf->BytesTotal          = fsize;
+        rdf->RangeCount          = 1;
     }
     oserr = ERROR_SUCCESS;
     return true;
@@ -1773,7 +1777,7 @@ bool LLCALL_C io_jobq_wait_not_full(io_rdpendq_t *pendq, uint32_t timeout_ms)
     return io_srsw_fifo_wait_not_full(pendq, timeout_ms);
 }
 
-bool LLCALL_C io_jobp_wait_not_empty(io_rdpendq_t *pendq, uint32_t timeout_ms)
+bool LLCALL_C io_jobq_wait_not_empty(io_rdpendq_t *pendq, uint32_t timeout_ms)
 {
     return io_srsw_fifo_wait_not_empty(pendq, timeout_ms);
 }
@@ -1807,9 +1811,14 @@ bool LLCALL_C io_completionq_wait_not_full(io_rddoneq_t *doneq, uint32_t timeout
     return io_srsw_fifo_wait_not_full(doneq, timeout_ms);
 }
 
-bool LLCALL_C io_completionp_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeout_ms)
+bool LLCALL_C io_completionq_wait_not_empty(io_rddoneq_t *doneq, uint32_t timeout_ms)
 {
     return io_srsw_fifo_wait_not_empty(doneq, timeout_ms);
+}
+
+bool LLCALL_C io_completionq_get(io_rddoneq_t *doneq, io_rdq_result_t &result)
+{
+    return io_srsw_fifo_get(doneq, result);
 }
 
 io_rdstopq_t* LLCALL_C io_create_cancelq(size_t capacity)
@@ -1860,9 +1869,14 @@ void LLCALL_C io_delete_dataq(io_rdopq_t *dataq)
     }
 }
 
-bool LLCALL_C io_datap_wait_not_empty(io_rdopq_t *dataq, uint32_t timeout_ms)
+bool LLCALL_C io_dataq_wait_not_empty(io_rdopq_t *dataq, uint32_t timeout_ms)
 {
     return io_srsw_fifo_wait_not_empty(dataq, timeout_ms);
+}
+
+bool LLCALL_C io_dataq_get(io_rdopq_t *dataq, io_rdop_t &op)
+{
+    return io_srsw_fifo_get(dataq, op);
 }
 
 io_rdq_t* LLCALL_C io_create_rdq(io_rdq_config_t &config)
@@ -2148,7 +2162,7 @@ void LLCALL_C io_rdq_poll(io_rdq_t *rdq)
 
     // perform job cleanup, move active->finished and remove finished.
     // this may update rdq->ActiveCount and signal rdq->Idle.
-    io_cull_finished_jobs(rdq);
+    io_cull_active_jobs(rdq);
     io_finish_jobs(rdq);
 }
 
