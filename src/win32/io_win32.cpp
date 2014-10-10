@@ -241,7 +241,7 @@ struct io_rdq_t
     io_rdq_file_t   *ActiveJobList; /// List of active job state; FileCount are valid.
     OVERLAPPED      *ActiveJobAIO;  /// List of active job async I/O state; FileCount are valid.
     HANDLE          *ActiveJobWait; /// List of active job wait handles; FileCount are valid.
-    size_t const     MaxReadSize;   /// Maximum number of bytes to read per-op.
+    size_t           MaxReadSize;   /// Maximum number of bytes to read per-op.
     io_rdbuffer_t    BufferManager; /// Management state for the I/O buffer pool.
     io_rdopq_t      *DataQueue;     /// Where to write io_rdop_t.
     io_rddoneq_t    *CompleteQueue; /// Where to write io_job_result_t.
@@ -1727,19 +1727,173 @@ bool LLCALL_C io_enumerate_files(io_file_list_t *dest, char const *path, char co
     return false;
 }
 
-/*
-    if (_ResolveVistaAPIs_)
-    {
-        HMODULE kernel = GetModuleHandle("kernel32.dll");
-        if (kernel != NULL)
+io_rdq_t* LLCALL_C io_create_rdq(io_rdq_config_t &config)
+{
+    // ensure that our required kernel32 entry points are resolved.
+    resolve_kernel_apis();
+
+    // get the page size on this system.
+    SYSTEM_INFO sysinfo = {0};
+    GetNativeSystemInfo_Func(&sysinfo);
+    size_t page_size    = sysinfo.dwPageSize;
+
+    // validate the queue configuration.
+    if (config.DataQueue     == NULL)  return NULL;
+    if (config.PendingQueue  == NULL)  return NULL;
+    if (config.CancelQueue   == NULL)  return NULL;
+    if (config.CompleteQueue == NULL)  return NULL;
+    if (config.MaxConcurrent  < 1)
+        config.MaxConcurrent  = 1;
+    if (config.MaxConcurrent  > IO_MAX_FILES)
+        config.MaxConcurrent  = IO_MAX_FILES;
+    if (config.MaxBufferSize  < IO_MIN_BUFFER_SIZE)
+        config.MaxBufferSize  = IO_MIN_BUFFER_SIZE;
+    if (config.MaxReadSize   == IO_ONE_PAGE)
+        config.MaxReadSize    = page_size;
+    if (config.MaxReadSize    < IO_MIN_READ_SIZE)
+        config.MaxReadSize    = IO_MIN_READ_SIZE;
+
+    io_rdq_t *rdq = (io_rdq_t*) malloc(sizeof(io_rdq_t));
+    rdq->Flags    =  IO_RDQ_FLAGS_NONE;
+    if (config.Unbuffered)   rdq->Flags |= IO_RDQ_FLAGS_UNBUFFERED;
+    if (config.Asynchronous) rdq->Flags |= IO_RDQ_FLAGS_ASYNC;
+
+    rdq->Idle           = CreateEvent(NULL, TRUE, TRUE, NULL); // manual reset; signaled.
+    rdq->OverflowCount  = 0;
+    rdq->DataOverflow   = (io_rdop_t    *) malloc(config.MaxConcurrent * sizeof(io_rdop_t));
+    rdq->CancelQueue    = config.CancelQueue;
+    rdq->PendingQueue   = config.PendingQueue;
+    rdq->ActiveCapacity = config.MaxConcurrent;
+    rdq->ActiveCount    = 0;
+    rdq->ActiveJobIds   = (uint32_t     *) malloc(config.MaxConcurrent * sizeof(uint32_t));
+    rdq->ActiveJobList  = (io_rdq_file_t*) malloc(config.MaxConcurrent * sizeof(io_rdq_file_t));
+    rdq->ActiveJobAIO   = (OVERLAPPED   *) malloc(config.MaxConcurrent * sizeof(OVERLAPPED));
+    rdq->ActiveJobWait  = (HANDLE       *) malloc(config.MaxConcurrent * sizeof(HANDLE));
+    rdq->MaxReadSize    = config.MaxReadSize;
+    rdq->DataQueue      = config.DataQueue;
+    rdq->CompleteQueue  = config.CompleteQueue;
+    rdq->FinishCapacity = config.MaxConcurrent;
+    rdq->FinishCount    = 0;
+    rdq->FinishJobIds   = (uint32_t     *) malloc(config.MaxConcurrent * sizeof(uint32_t));
+    rdq->FinishJobList  = (io_rdq_file_t*) malloc(config.MaxConcurrent * sizeof(io_rdq_file_t));
+    io_create_rdbuffer(&rdq->BufferManager, config.MaxBufferSize, config.MaxReadSize);
+    if (config.Asynchronous)
+    {   // initialize the OVERLAPPED structures with a manual reset event.
+        for (size_t i = 0; i < config.MaxConcurrent; ++i)
         {
-            GetNativeSystemInfo_Func        = (GetNativeSystemInfoFn)        GetProcAddress(kernel, "GetNativeSystemInfo");
-            SetProcessWorkingSetSizeEx_Func = (SetProcessWorkingSetSizeExFn) GetProcAddress(kernel, "SetProcessWorkingSetSizeEx");
+            rdq->ActiveJobAIO[i].Internal     = 0;
+            rdq->ActiveJobAIO[i].InternalHigh = 0;
+            rdq->ActiveJobAIO[i].Offset       = 0;
+            rdq->ActiveJobAIO[i].OffsetHigh   = 0;
+            rdq->ActiveJobAIO[i].hEvent       = CreateEvent(NULL, TRUE, FALSE, NULL);
         }
-        // fallback if either of these APIs are not available.
-        if (GetNativeSystemInfo_Func        == NULL) GetNativeSystemInfo_Func        = GetSystemInfo;
-        if (SetProcessWorkingSetSizeEx_Func == NULL) SetProcessWorkingSetSizeEx_Func = SetProcessWorkingSetSizeEx_Fallback;
-        _ResolveVistaAPIs_ = false;
     }
-*/
+    else
+    {   // initialize the OVERLAPPED structures to zero.
+        for (size_t i = 0; i < config.MaxConcurrent; ++i)
+        {
+            rdq->ActiveJobAIO[i].Internal     = 0;
+            rdq->ActiveJobAIO[i].InternalHigh = 0;
+            rdq->ActiveJobAIO[i].Offset       = 0;
+            rdq->ActiveJobAIO[i].OffsetHigh   = 0;
+            rdq->ActiveJobAIO[i].hEvent       = NULL;
+        }
+    }
+
+    // update the config to let the caller know what they actually got.
+    config.MaxBufferSize = rdq->BufferManager.TotalSize;
+    config.MaxReadSize   = rdq->BufferManager.AllocSize;
+    return rdq;
+}
+
+void LLCALL_C io_delete_rdq(io_rdq_t *rdq)
+{
+    if (rdq != NULL)
+    {
+        uint32_t nreturns  = rdq->FinishCount;
+        uint32_t nactive   = rdq->ActiveCount;
+        uint32_t npending  = rdq->PendingQueue != NULL ? io_srsw_fifo_count(rdq->PendingQueue) : 0;
+        assert(nreturns == 0 && nactive == 0 && npending == 0);
+
+        if (rdq->ActiveJobAIO != NULL && (rdq->Flags & IO_RDQ_FLAGS_ASYNC))
+        {   // clean up the manual reset events allocated to the AIOs.
+            for (size_t i = 0; i < rdq->ActiveCount; ++i)
+            {
+                if (rdq->ActiveJobAIO[i].hEvent != NULL)
+                {
+                    CloseHandle(rdq->ActiveJobAIO[i].hEvent);
+                    rdq->ActiveJobAIO[i].hEvent  = NULL;
+                }
+            }
+        }
+        io_delete_rdbuffer(&rdq->BufferManager);
+        if (rdq->FinishJobList != NULL) free(rdq->FinishJobList);
+        if (rdq->FinishJobIds  != NULL) free(rdq->FinishJobIds);
+        if (rdq->ActiveJobWait != NULL) free(rdq->ActiveJobWait);
+        if (rdq->ActiveJobAIO  != NULL) free(rdq->ActiveJobAIO);
+        if (rdq->ActiveJobList != NULL) free(rdq->ActiveJobList);
+        if (rdq->ActiveJobIds  != NULL) free(rdq->ActiveJobIds);
+        if (rdq->DataOverflow  != NULL) free(rdq->DataOverflow);
+        if (rdq->Idle != INVALID_HANDLE_VALUE) CloseHandle(rdq->Idle);
+
+        rdq->Flags          = IO_RDQ_FLAGS_NONE;
+        rdq->Idle           = INVALID_HANDLE_VALUE;
+        rdq->OverflowCount  = 0;
+        rdq->DataOverflow   = NULL;
+        rdq->CancelQueue    = NULL;
+        rdq->PendingQueue   = NULL;
+        rdq->ActiveCapacity = 0;
+        rdq->ActiveCount    = 0;
+        rdq->ActiveJobIds   = NULL;
+        rdq->ActiveJobList  = NULL;
+        rdq->ActiveJobAIO   = NULL;
+        rdq->ActiveJobWait  = NULL;
+        rdq->DataQueue      = NULL;
+        rdq->CompleteQueue  = NULL;
+        rdq->FinishCapacity = 0;
+        rdq->FinishCount    = 0;
+        rdq->FinishJobIds   = NULL;
+        rdq->FinishJobList  = NULL;
+        free(rdq);
+    }
+}
+
+bool LLCALL_C io_rdq_poll_idle(io_rdq_t *rdq)
+{
+    uint32_t const noverflow = uint32_t(rdq->OverflowCount);
+    uint32_t const nactive   = uint32_t(rdq->ActiveCount);
+    uint32_t const nfinish   = uint32_t(rdq->FinishCount);
+    uint32_t const npending  = io_srsw_fifo_count(rdq->PendingQueue);
+    return (noverflow == 0  && nactive == 0 && nfinish == 0 && npending == 0);
+}
+
+bool LLCALL_C io_rdq_wait_idle(io_rdq_t *rdq, uint32_t timeout_ms)
+{
+    DWORD   result  = WaitForSingleObjectEx(rdq->Idle, timeout_ms, TRUE);
+    return (result == WAIT_OBJECT_0);
+}
+
+void LLCALL_C io_rdq_cancel_all(io_rdq_t *rdq)
+{
+    uintptr_t address = (uintptr_t) &rdq->Flags;
+    uint32_t  flags   = rdq->Flags | IO_RDQ_FLAGS_CANCEL_ALL;
+    io_atomic_write_uint32_aligned(address, flags);
+}
+
+void LLCALL_C io_rdq_cancel_one(io_rdq_t *rdq, uint32_t id)
+{
+    io_srsw_fifo_put(rdq->CancelQueue, id);
+}
+
+bool LLCALL_C io_rdq_submit(io_rdq_t *rdq, io_rdq_job_t const &job)
+{   // note: potential issue here with the lifetime of job.Path.
+    // do we copy the string and free it on job dequeue?
+    io_rdq_job_t job_copy = job;
+    job_copy.EnqueueTime  = io_timestamp();
+    if (job_copy.Path == NULL) return false;
+    if (job_copy.RangeCount > IO_MAX_RANGES)
+        job_copy.RangeCount = IO_MAX_RANGES;
+
+    return io_srsw_fifo_put(rdq->PendingQueue, job_copy);
+}
 

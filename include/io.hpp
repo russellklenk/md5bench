@@ -43,6 +43,23 @@
 #define IO_MAX_RANGES      16
 #endif
 
+/// @summary Define the minimum buffer size for a concurrent read queue.
+/// On a system with 4KB pages, this is enough for 256 in-flight operations, 
+/// assuming a maximum read size of 4KB.
+#ifndef IO_MIN_BUFFER_SIZE
+#define IO_MIN_BUFFER_SIZE 1024 * 1024
+#endif
+
+/// @summary Define the absolute minimum size of any I/O buffer, in bytes. 
+/// This corresponds to the typical minimum sector size.
+#ifndef IO_MIN_READ_SIZE
+#define IO_MIN_READ_SIZE   512
+#endif
+
+/// @summary Specify IO_ONE_PAGE in io_rdq_config_t::MaxReadSize to limit the 
+/// maximum read size to the size of one virtual memory manager page.
+#define IO_ONE_PAGE        0
+
 /// @summary Define the maximum number of files that can possibly be active in 
 /// an io_rdq_t at any given time.
 #define IO_MAX_FILES       64
@@ -276,6 +293,57 @@ IO_C_API(void) io_format_file_list(FILE *fp, io_file_list_t const *list);
 /// @param recurse Specify true to recurse into subdirectories.
 /// @return true if enumeration completed without error.
 IO_C_API(bool) io_enumerate_files(io_file_list_t *dest, char const *path, char const *filter, bool recurse);
+
+/// @summary Allocates resources for and initializes a concurrent read queue.
+/// @param config Options used to specify the queue behavior. This structure 
+/// will be updated with the actual configuration values used.
+/// @return A pointer to the new queue, or NULL.
+IO_C_API(io_rdq_t*) io_create_rdq(io_rdq_config_t &config);
+
+/// @summary Frees resources associated with a concurrent read queue. The queue
+/// should be idle with no pending jobs prior to being freed. To ensure that 
+/// this is the case, call io_rdq_cancel_all(), io_rdq_poll() [one or more times],
+/// and either io_rdq_poll_idle() or io_rdq_wait_idle(), depending on your design.
+/// @param rdq The read queue to delete.
+IO_C_API(void) io_delete_rdq(io_rdq_t *rdq);
+
+/// @summary Determines whether the queue is idle, meaning that there are no 
+/// pending jobs, no active jobs, and no jobs waiting on buffers to be returned.
+/// This is typically used by either the job manager or the completion monitor.
+/// @param rdq The read queue to poll for status.
+/// @return true if the queue is idle.
+IO_C_API(bool) io_rdq_poll_idle(io_rdq_t *rdq);
+
+/// @summary Block the calling thread until the queue becomes idle, meaning 
+/// that there are no pending jobs, no active jobs, and no jobs waiting on 
+/// buffers to be returned. This is typically used by either the job manager 
+/// or the completion monitor.
+/// @param rdq The read queue to wait on.
+/// @param timeout_ms The maximum amount of time to wait, in milliseconds. 
+/// Specify IO_WAIT_FOREVER to block indefinitely.
+/// @return true if the queue has become idle, or false if the timeout interval
+/// elapsed or an error occurred. 
+IO_C_API(bool) io_rdq_wait_idle(io_rdq_t *rdq, uint32_t timeout_ms);
+
+/// @summary Cancels all pending and active jobs. Note that there may still be
+/// jobs waiting for buffers to be returned; if this is the case, the queue will
+/// report as not idle after the next poll cycle. This is typically used by the job manager.
+/// @param rdq The target queue.
+IO_C_API(void) io_rdq_cancel_all(io_rdq_t *rdq);
+
+/// @summary Cancels a single specific job on the next poll cycle. This is 
+/// typically used by the job manager.
+/// @param rdq The target queue.
+/// @param id The identifier of the job to cancel, as was specified on the job
+/// definition passed to io_rdq_submit() used to add the job.
+IO_C_API(void) io_rdq_cancel_one(io_rdq_t *rdq, uint32_t id);
+
+/// @summary Submits a new job to the pending queue of a concurrent read queue.
+/// @param rdq The target queue.
+/// @param job A description of the file operation.
+/// @return true if the job was added to the pending queue, or false if the 
+/// pending queue is full and the job could not be submitted.
+IO_C_API(bool) io_rdq_submit(io_rdq_t *rdq, io_rdq_job_t const &job);
 
 #ifdef __cplusplus
 }; // extern "C"
