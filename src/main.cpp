@@ -163,7 +163,7 @@ static int test_md5_file(FILE *fp, char const *path)
     return EXIT_SUCCESS;
 }
 
-static void test_io_sync_seq(FILE *fp, char const *path)
+static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t max_read, bool unbuffered, bool async)
 {
     io_file_list_t files;
     io_create_file_list(&files, 0, 0);
@@ -180,11 +180,11 @@ static void test_io_sync_seq(FILE *fp, char const *path)
     qconf.PendingQueue    = jobq;
     qconf.CancelQueue     = cancelq;
     qconf.CompleteQueue   = finishq;
-    qconf.MaxConcurrent   = 1;
+    qconf.MaxConcurrent   = concurrent;
     qconf.MaxBufferSize   = 16 * 1024 * 1024; // 16MB
-    qconf.MaxReadSize     = IO_ONE_PAGE;
-    qconf.Unbuffered      = false;
-    qconf.Asynchronous    = false;
+    qconf.MaxReadSize     = max_read;
+    qconf.Unbuffered      = unbuffered;
+    qconf.Asynchronous    = async;
     io_rdq_t *rdq = io_create_rdq(qconf);
 
     size_t pend_count = files.PathCount;
@@ -228,10 +228,10 @@ static void test_io_sync_seq(FILE *fp, char const *path)
         }
 
         // block indefinitely until an I/O has completed.
-        //if (io_rdq_wait_io(rdq, IO_WAIT_FOREVER))
-        //{
+        if (io_rdq_wait_io(rdq, max_wait))
+        {
             io_rdq_poll(rdq);
-        //}
+        }
 
         // process any data returned by the I/O manager.
         io_rdop_t read;
@@ -259,7 +259,10 @@ static void test_io_sync_seq(FILE *fp, char const *path)
     uint64_t d = duration(begin_tm, end_tm);
     double sec = seconds(d);
 
-    printf("I/O synchronous/sequential/1 took %f seconds (%fMB/sec.)\n", sec, (total_nb/(1024*1024)) / sec);
+    printf("test_io_seq: Max Active: %u, Max Read: %u, Unbuffered: %u, AIO: %u.\n", unsigned(concurrent), unsigned(max_read), unsigned(unbuffered ? 1 : 0), unsigned(async ? 1 : 0));
+    printf("  Read %8" PRIu64 " bytes in %4.3f seconds (%4.3fMB/sec) (%8.3f bytes/sec).\n", total_nb, sec, (total_nb/(1024*1024)) / sec, total_nb / sec);
+    printf("\n");
+    //printf("Total bytes read: %I64u (%I64u MB)\n", total_nb, total_nb / (1024*1024));
     
     free(job_list);
     io_delete_rdq(rdq);
@@ -293,10 +296,10 @@ int main(int argc, char **argv)
         exit_code = test_md5_file(stdout, argv[1]);
     }
 
-    io_file_list_t files;
+    /*io_file_list_t files;
     io_create_file_list(&files, 0, 0);
     io_enumerate_files (&files, "D:\\workspace", "*.*", true);
-    //io_format_file_list(stdout, &files);
+    io_format_file_list(stdout, &files);
     if (io_verify_file_list(&files))
     {
         printf("The file list verifies.\n");
@@ -305,9 +308,13 @@ int main(int argc, char **argv)
     {
         printf("The file list contains collisions.\n");
     }
-    io_delete_file_list(&files);
+    io_delete_file_list(&files);*/
 
-    test_io_sync_seq(stdout, "D:\\ArcVolsR10Stage");
+    //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, false, false);
+    //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, false, true);
+    //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, true , true);
+    //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, true , false);
+    test_io_seq(stdout, "C:\\WinDDK", 8, 64 * 1024, true, true);
 
     time_service_close();
     exit(exit_code);

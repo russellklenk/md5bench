@@ -5,6 +5,7 @@
 /*////////////////
 //   Includes   //
 ////////////////*/
+#include <inttypes.h>
 #include <windows.h>
 #include <ctype.h>
 #include "io.hpp"
@@ -206,6 +207,7 @@ struct io_rdq_file_t
 {
     #define NR       IO_MAX_RANGES
     HANDLE           File;          /// The file handle, or INVALID_FILE_HANDLE.
+    OVERLAPPED      *AIO;           /// The OVERLAPPED structure assigned to this file.
     void            *TargetBuffer;  /// The target buffer for the current read, or NULL.
     size_t           SectorSize;    /// The physical sector size of the disk, in bytes.
     uint64_t         BytesRead;     /// The total number of bytes read so far.
@@ -241,9 +243,11 @@ struct io_rdq_t
     size_t           ActiveCapacity;/// Maximum number of files opened concurrently.
     size_t           ActiveCount;   /// Current number of files opened.
     uint32_t        *ActiveJobIds;  /// List of active job IDs; FileCount are valid.
-    io_rdq_file_t   *ActiveJobList; /// List of active job state; FileCount are valid.
     OVERLAPPED      *ActiveJobAIO;  /// List of active job async I/O state; FileCount are valid.
+    io_rdq_file_t   *ActiveJobList; /// List of active job state; FileCount are valid.
     HANDLE          *ActiveJobWait; /// List of active job wait handles; FileCount are valid.
+    size_t           FreeAIOCount;  /// Current number of unused OVERLAPPED structures.
+    OVERLAPPED     **ActiveAIOFree; /// List of unused async I/O state; FreeAIOCount are valid.
     size_t           MaxReadSize;   /// Maximum number of bytes to read per-op.
     io_rdbuffer_t    BufferManager; /// Management state for the I/O buffer pool.
     io_rdopq_t      *DataQueue;     /// Where to write io_rdop_t.
@@ -912,7 +916,10 @@ static void* io_rdbuffer_get(io_rdbuffer_t *rdbuf)
 /// @param addr The address returned by a previous call to io_rdbuffer_get().
 static void io_rdbuffer_put(io_rdbuffer_t *rdbuf, void *addr)
 {
-    rdbuf->FreeList[rdbuf->FreeCount++] = addr;
+    if (addr != NULL) 
+    {
+        rdbuf->FreeList[rdbuf->FreeCount++] = addr;
+    }
 }
 
 /// @summary Allocates storage for a new return queue and initializes it to empty.
@@ -944,6 +951,27 @@ static io_returnq_t* io_delete_returnq(io_returnq_t *rq)
         free(rq);
     }
     return NULL;
+}
+
+/// @summary Retrieves an OVERLAPPED instance from the free list.
+/// @param rdq The concurrent read queue to allocate from.
+/// @return A pointer to the asynchronous I/O state.
+static OVERLAPPED* io_overlapped_get(io_rdq_t *rdq)
+{
+    assert(rdq->FreeAIOCount > 0);
+    return rdq->ActiveAIOFree[--rdq->FreeAIOCount];
+}
+
+/// @summary Returns an OVERLAPPED instance to the free list.
+/// @param rdq The concurrent read queue.
+/// @param aio The OVERLAPPED instance to return.
+static void io_overlapped_put(io_rdq_t *rdq, OVERLAPPED *aio)
+{
+    if (aio != NULL)
+    {
+        assert(rdq->FreeAIOCount < rdq->ActiveCapacity);
+        rdq->ActiveAIOFree[rdq->FreeAIOCount++] = aio;
+    }
 }
 
 /// @summary Calculates statistics and posts a job result to the completion queue 
@@ -1042,14 +1070,11 @@ static bool io_finish(io_rdq_t *rdq, size_t active_index)
         else return false;
     }
 
-    // this job will not be needing any pending I/O buffer.
-    // @todo: this should not be done for normal jobs. should it 
-    // be done for cancelled jobs? investigate.
-    /*if (rdq->ActiveJobList[active_index].TargetBuffer != NULL)
-    {   // return the target buffer to the pool.
-        io_rdbuffer_put(&rdq->BufferManager, rdq->ActiveJobList[active_index].TargetBuffer);
-        rdq->ActiveJobList[active_index].TargetBuffer  = NULL;
-    }*/
+    if (rdq->ActiveJobList[active_index].AIO != NULL)
+    {   // there are no more outstanding I/Os. return AIO to the free list.
+        io_overlapped_put(rdq, rdq->ActiveJobList[active_index].AIO);
+        rdq->ActiveJobList[active_index].AIO  = NULL;
+    }
 
     // copy the job from the active list to the finished list.
     size_t             finish_index  = rdq->FinishCount;
@@ -1066,7 +1091,6 @@ static bool io_finish(io_rdq_t *rdq, size_t active_index)
     {
         rdq->ActiveJobIds [active_index] = rdq->ActiveJobIds [last_active];
         rdq->ActiveJobList[active_index] = rdq->ActiveJobList[last_active];
-        rdq->ActiveJobAIO [active_index] = rdq->ActiveJobAIO [last_active];
         rdq->ActiveJobWait[active_index] = rdq->ActiveJobWait[last_active];
     }
     // @note: io_cull_finished_jobs(), which calls this function, decrements
@@ -1131,7 +1155,6 @@ static void io_finish_jobs(io_rdq_t *rdq)
 /// @param rdq The read queue being updated.
 static void io_process_cancellations(io_rdq_t *rdq)
 {
-    bool did_signal_idle  = false;
     if (rdq->Flags & IO_RDQ_FLAGS_CANCEL_ALL)
     {
         // the only potential change to flags that could be made outside of 
@@ -1190,8 +1213,6 @@ static void io_process_cancellations(io_rdq_t *rdq)
             rdf.Status   |= IO_RDQ_FILE_CANCELLED;
             rdf.NanosEnd  = io_timestamp();
         }
-        io_cull_active_jobs(rdq);
-        io_finish_jobs(rdq);
 
         // flush all pending overflows and return their associated buffers.
         size_t const noverflow = rdq->OverflowCount;
@@ -1200,14 +1221,6 @@ static void io_process_cancellations(io_rdq_t *rdq)
             io_rdbuffer_put(&rdq->BufferManager, rdq->DataOverflow[i].DataBuffer);
         }
         rdq->OverflowCount = 0;
-
-        // at this point, all we might have remaining is jobs waiting on 
-        // buffers to be returned. signal that we are idle if necessary.
-        if (rdq->FinishCount == 0)
-        {
-            did_signal_idle = true;
-            SetEvent(rdq->Idle);
-        }
     }
 
     // process the cancellation queue. any items to be cancelled here may 
@@ -1225,7 +1238,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
                 if (ids[j] == id)
                 {
                     io_rdq_file_t &rdf = rdq->ActiveJobList[j];
-                    OVERLAPPED    *aio =&rdq->ActiveJobAIO [j];
+                    OVERLAPPED    *aio = rdf.AIO;
                     if (rdf.Status & IO_RDQ_FILE_PENDING_AIO)
                     {   // cancel the pending I/O, but don't wait for it to 
                         // finish. the completion will be picked up on a later
@@ -1246,6 +1259,7 @@ static void io_process_cancellations(io_rdq_t *rdq)
                             if (rdq->DataOverflow[k].DataBuffer == rdf.TargetBuffer)
                             {   // swap the last overflow into slot 'k'.
                                 rdq->DataOverflow[k] = rdq->DataOverflow[--rdq->OverflowCount];
+                                rdf.TargetBuffer = NULL;
                                 rdf.ReturnCount--;
                                 break;
                             }
@@ -1257,19 +1271,6 @@ static void io_process_cancellations(io_rdq_t *rdq)
             }
         }
     }
-
-    // move any cancelled jobs from active to finish, and then 
-    // complete any finished jobs. jobs pending buffer returns 
-    // remain in the finished list.
-    io_cull_active_jobs(rdq);
-    io_finish_jobs(rdq);
-
-    // signal the idle event if there are no active or pending
-    // jobs, and we didn't signal the event processing cancel all.
-    size_t nactive  = rdq->ActiveCount + rdq->FinishCount;
-    size_t npending = io_srsw_fifo_count(rdq->PendingQueue);
-    if (nactive + npending == 0 && !did_signal_idle)
-        SetEvent(rdq->Idle);
 }
 
 /// @summary Attempts to publish any overflow data buffers to the data queue. 
@@ -1362,6 +1363,7 @@ static bool io_prepare_job(io_rdq_t *rdq, io_rdq_file_t *rdf, io_rdq_job_t const
     // everything looks good, so initialize the state.
     rdf->File             = file;
     rdf->TargetBuffer     = NULL;
+    rdf->AIO              = io_overlapped_get(rdq);
     rdf->SectorSize       = ssize;
     rdf->BytesRead        = 0;
     rdf->Status           = IO_RDQ_FILE_NONE;
@@ -1448,12 +1450,15 @@ static void io_rdq_poll_sync(io_rdq_t *rdq)
             // post the successful read to the data queue.
             if (io_srsw_fifo_put(rdq->DataQueue, rop))
             {   // the read operation was successfully enqueued.
+                rdf.TargetBuffer = NULL;
                 rdf.ReturnCount++;
             }
             else
             {   // the data queue is full. try again at the start of the next 
                 // io_rdq_poll() cycle. this causes a hard stall. the return 
                 // count is incremented in anticipation of successful enqueue.
+                // rdf.TargetBuffer is set to NULL when the rop is delivered 
+                // to the data queue from the overflow buffer.
                 rdq->DataOverflow[rdq->OverflowCount++] = rop;
                 rdf.ReturnCount++;
             }
@@ -1474,6 +1479,8 @@ static void io_rdq_poll_sync(io_rdq_t *rdq)
             }
             CloseHandle(rdf.File);
             rdf.File = INVALID_HANDLE_VALUE;
+            io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+            rdf.TargetBuffer = NULL;
         }
     }
 }
@@ -1489,7 +1496,7 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
     for (size_t i = 0; i < nfiles; ++i)
     {
         io_rdq_file_t &rdf = rdq->ActiveJobList[i];
-        OVERLAPPED    *aio =&rdq->ActiveJobAIO [i];
+        OVERLAPPED    *aio = rdf.AIO;
         DWORD          err = ERROR_SUCCESS;
         DWORD          nbt = 0;
         BOOL           res = FALSE;
@@ -1528,12 +1535,15 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                 // post the successful read to the data queue.
                 if (io_srsw_fifo_put(rdq->DataQueue, rop))
                 {   // the read operation was successfully enqueued.
+                    rdf.TargetBuffer = NULL;
                     rdf.ReturnCount++;
                 }
                 else
                 {   // the data queue is full. try again at the start of the next 
                     // io_rdq_poll() cycle. this causes a hard stall. the return 
                     // count is incremented in anticipation of successful enqueue.
+                    // rdf.TargetBuffer is set to NULL when the rop is delivered 
+                    // to the data queue from the overflow buffer.
                     rdq->DataOverflow[rdq->OverflowCount++] = rop;
                     rdf.ReturnCount++;
                 }
@@ -1555,6 +1565,8 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                     rdf.Status   |= IO_RDQ_FILE_CANCELLED;
                     rdf.NanosEnd  = io_timestamp();
                     schedule_io   = false;
+                    io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+                    rdf.TargetBuffer = NULL;
                 }
                 else if (err == ERROR_HANDLE_EOF)
                 {   // end-of-file was reached. clean up.
@@ -1563,6 +1575,8 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                     rdf.Status  |= IO_RDQ_FILE_FINISHED | IO_RDQ_FILE_EOF;
                     rdf.NanosEnd = io_timestamp();
                     schedule_io  = false;
+                    io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+                    rdf.TargetBuffer = NULL;
                 }
                 else
                 {   // an error occurred while processing the request.
@@ -1572,6 +1586,8 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                     rdf.OSError  = err;
                     rdf.NanosEnd = io_timestamp();
                     schedule_io  = false;
+                    io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+                    rdf.TargetBuffer = NULL;
                 }
             }
         }
@@ -1637,12 +1653,15 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                 // post the successful read to the data queue.
                 if (io_srsw_fifo_put(rdq->DataQueue, rop))
                 {   // the read operation was successfully enqueued.
+                    rdf.TargetBuffer = NULL;
                     rdf.ReturnCount++;
                 }
                 else
                 {   // the data queue is full. try again at the start of the next 
                     // io_rdq_poll() cycle. this causes a hard stall. the return 
                     // count is incremented in anticipation of successful enqueue.
+                    // rdf.TargetBuffer is set to NULL when the rop is delivered 
+                    // to the data queue from the overflow buffer.
                     rdq->DataOverflow[rdq->OverflowCount++] = rop;
                     rdf.ReturnCount++;
                 }
@@ -1662,6 +1681,8 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                     rdf.File     = INVALID_HANDLE_VALUE;
                     rdf.Status  |= IO_RDQ_FILE_FINISHED | IO_RDQ_FILE_EOF;
                     rdf.NanosEnd = io_timestamp();
+                    io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+                    rdf.TargetBuffer = NULL;
                 }
                 else
                 {   // an error occurred while processing the request.
@@ -1670,6 +1691,8 @@ static void io_rdq_poll_async(io_rdq_t *rdq)
                     rdf.Status  |= IO_RDQ_FILE_ERROR;
                     rdf.OSError  = err;
                     rdf.NanosEnd = io_timestamp();
+                    io_rdbuffer_put(&rdq->BufferManager, rdf.TargetBuffer);
+                    rdf.TargetBuffer = NULL;
                 }
             }
         }
@@ -1921,6 +1944,8 @@ io_rdq_t* LLCALL_C io_create_rdq(io_rdq_config_t &config)
     rdq->ActiveJobList  = (io_rdq_file_t*) malloc(config.MaxConcurrent * sizeof(io_rdq_file_t));
     rdq->ActiveJobAIO   = (OVERLAPPED   *) malloc(config.MaxConcurrent * sizeof(OVERLAPPED));
     rdq->ActiveJobWait  = (HANDLE       *) malloc(config.MaxConcurrent * sizeof(HANDLE));
+    rdq->FreeAIOCount   = config.MaxConcurrent;
+    rdq->ActiveAIOFree  = (OVERLAPPED  **) malloc(config.MaxConcurrent * sizeof(OVERLAPPED*));
     rdq->MaxReadSize    = config.MaxReadSize;
     rdq->DataQueue      = config.DataQueue;
     rdq->CompleteQueue  = config.CompleteQueue;
@@ -1950,6 +1975,12 @@ io_rdq_t* LLCALL_C io_create_rdq(io_rdq_config_t &config)
             rdq->ActiveJobAIO[i].OffsetHigh   = 0;
             rdq->ActiveJobAIO[i].hEvent       = NULL;
         }
+    }
+    // initialize the OVERLAPPED freelist. all items 
+    // start out on the free list.
+    for (size_t i = 0; i < config.MaxConcurrent; ++i)
+    {
+        rdq->ActiveAIOFree[i] = &rdq->ActiveJobAIO[i];
     }
 
     // update the config to let the caller know what they actually got.
@@ -1984,6 +2015,7 @@ void LLCALL_C io_delete_rdq(io_rdq_t *rdq)
         io_delete_rdbuffer(&rdq->BufferManager);
         if (rdq->FinishJobList != NULL) free(rdq->FinishJobList);
         if (rdq->FinishJobIds  != NULL) free(rdq->FinishJobIds);
+        if (rdq->ActiveAIOFree != NULL) free(rdq->ActiveAIOFree);
         if (rdq->ActiveJobWait != NULL) free(rdq->ActiveJobWait);
         if (rdq->ActiveJobAIO  != NULL) free(rdq->ActiveJobAIO);
         if (rdq->ActiveJobList != NULL) free(rdq->ActiveJobList);
@@ -2003,6 +2035,8 @@ void LLCALL_C io_delete_rdq(io_rdq_t *rdq)
         rdq->ActiveJobList  = NULL;
         rdq->ActiveJobAIO   = NULL;
         rdq->ActiveJobWait  = NULL;
+        rdq->FreeAIOCount   = 0;
+        rdq->ActiveAIOFree  = NULL;
         rdq->DataQueue      = NULL;
         rdq->CompleteQueue  = NULL;
         rdq->FinishCapacity = 0;
@@ -2090,6 +2124,11 @@ void LLCALL_C io_rdq_poll(io_rdq_t *rdq)
     // pending, then this may block until all active jobs have been cancelled.
     io_process_cancellations(rdq);
 
+    // perform job cleanup, move active->finished and remove finished.
+    // this may update rdq->ActiveCount and signal rdq->Idle.
+    io_cull_active_jobs(rdq);
+    io_finish_jobs(rdq);
+
     // attempt to push any queued read operations (at most, rdq->ActiveCapacity)
     // to the DataQueue for processing. if there are any queued read operations 
     // remaining in the overflow buffer, we cannot continue with the poll cycle.
@@ -2152,18 +2191,13 @@ void LLCALL_C io_rdq_poll(io_rdq_t *rdq)
         // note that io_prepare_job wrote into rdq->ActiveJobList[active_index].
         rdf->NanosDeq     = start_time;
         rdq->ActiveJobIds [active_index] = job.JobId;
-        rdq->ActiveJobWait[active_index] = rdq->ActiveJobAIO[active_index].hEvent;
+        rdq->ActiveJobWait[active_index] = rdf->AIO->hEvent;
         rdq->ActiveCount++;
     }
 
     // update and schedule I/O operations against the active job list.
     if (rdq->Flags & IO_RDQ_FLAGS_ASYNC) io_rdq_poll_async(rdq);
     else io_rdq_poll_sync(rdq);
-
-    // perform job cleanup, move active->finished and remove finished.
-    // this may update rdq->ActiveCount and signal rdq->Idle.
-    io_cull_active_jobs(rdq);
-    io_finish_jobs(rdq);
 }
 
 bool LLCALL_C io_return_buffer(io_returnq_t *returnq, void *buffer)
