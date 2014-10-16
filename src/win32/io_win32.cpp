@@ -69,9 +69,17 @@ static LARGE_INTEGER                _Frequency_                     = {0};
 //////////////////*/
 /// @summary MinGW doesn't define a bunch of these constants and structures.
 #ifdef __GNUC__
+#ifndef METHOD_BUFFERED
 #define METHOD_BUFFERED                    0
+#endif
+
+#ifndef FILE_ANY_ACCESS
 #define FILE_ANY_ACCESS                    0
+#endif
+
+#ifndef FILE_DEVICE_MASS_STORAGE
 #define FILE_DEVICE_MASS_STORAGE           0x0000002d
+#endif
 
 #ifndef ERROR_OFFSET_ALIGNMENT_VIOLATION
 #define ERROR_OFFSET_ALIGNMENT_VIOLATION   0x00000147
@@ -91,9 +99,15 @@ static LARGE_INTEGER                _Frequency_                     = {0};
 )
 #endif
 
+#ifndef IOCTL_STORAGE_BASE
 #define IOCTL_STORAGE_BASE           FILE_DEVICE_MASS_STORAGE
-#define IOCTL_STORAGE_QUERY_PROPERTY CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
 
+#ifndef IOCTL_STORAGE_QUERY_PROPERTY
+#define IOCTL_STORAGE_QUERY_PROPERTY CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ <= 8)
 typedef enum _STORAGE_PROPERTY_ID {
     StorageDeviceProperty = 0,
     StorageAdapterProperty,
@@ -124,7 +138,9 @@ typedef struct _STORAGE_PROPERTY_QUERY {
     STORAGE_QUERY_TYPE  QueryType;
     UCHAR               AdditionalParameters[1];
 } STORAGE_PROPERTY_QUERY, *PSTORAGE_PROPERTY_QUERY;
+#endif /* __GNUC__ < 4.9 */
 
+#if (__GNUC__ < 4) || (__GNUC__ == 4 && __GNUC_MINOR__ <= 9)
 typedef struct _STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR {
     DWORD Version;
     DWORD Size;
@@ -134,6 +150,7 @@ typedef struct _STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR {
     DWORD BytesPerPhysicalSector;
     DWORD BytesOffsetForSectorAlignment;
 } STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, *PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR;
+#endif /* __GNUC__ <= 4.9 */
 #endif /* __GNUC__ */
 
 /// @summary Bitflags that can be set on a read queue.

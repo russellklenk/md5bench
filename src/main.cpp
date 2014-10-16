@@ -5,6 +5,7 @@
 /*////////////////
 //   Includes   //
 ////////////////*/
+#include <thread>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,26 @@
 ///////////////////*/
 /// @summary Define the function signature for all of our MD5 implementations.
 typedef void (LLCALL_C *md5_mem_fn)(void *, void const *, size_t);
+
+/// @summary Define the arguments used to configure a test run of the I/O manager.
+struct jobmgr_config_t
+{
+    char const *Path;           /// The path of the directory to operate on.
+    FILE       *Output;         /// The file stream to which output will be written.
+    size_t      MaxConcurrent;  /// The maximum number of files to stream concurrently.
+    size_t      ReadBufferSize; /// The size of the read buffer, in bytes, or IO_ONE_PAGE.
+    bool        UnbufferedIO;   /// true to use unbuffered I/O.
+    bool        AsynchronousIO; /// true to use asynchronous I/O calls.
+};
+
+/// @summary Define the state associated with a checksum calculation job. This
+/// state is identical between the sequential and multi-threaded tasks. 
+/// Calculating a checksum is a low-CPU intensity task.
+struct chksum_job_t
+{
+    uint32_t    Id;             /// The job ID (and the job's array index.)
+    uint32_t    Checksum;       /// The current checksum state.
+};
 
 /*///////////////////////
 //   Local Functions   //
@@ -163,11 +184,190 @@ static int test_md5_file(FILE *fp, char const *path)
     return EXIT_SUCCESS;
 }
 
-static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t max_read, bool unbuffered, bool async)
+/// @summary Implements the entry point of the job completion manager thread. 
+/// The job completion manager monitors the completion queue, looking for 
+/// any completed jobs, and exits when all jobs have finished.
+/// @param doneq The job completion queue to monitor.
+/// @param job_list The set of per-job state.
+/// @param job_count The total number of jobs expected to complete.
+/// @param exit_signal The value to set to non-zero when all jobs have completed.
+static void jcm_main(io_rddoneq_t *doneq, chksum_job_t *job_list, size_t job_count, uint32_t volatile *exit_signal, uint64_t &total_bytes)
+{
+    size_t fin_count = 0;
+    while (fin_count < job_count)
+    {
+        if (io_completionq_wait_not_empty(doneq, IO_WAIT_FOREVER))
+        {
+            io_rdq_result_t result;
+            if (io_completionq_get(doneq, result))
+            {
+                total_bytes += result.BytesJob;
+                fin_count++;
+            }
+        }
+    }
+    *exit_signal = 1; // tell everyone else that we're done.
+}
+
+/// @summary Implements the entry point for the data processing coordinator 
+/// thread, which retrieves data buffers from the successful read operation 
+/// queue and processes them (or dispatches them to a thread pool for 
+/// processing.) The thread exits when signaled by the job manager thread.
+/// @param opq The queue to monitor for successful read operations.
+/// @param job_list The set of per-job state.
+/// @param job_count The number of jobs in job_list.
+/// @param exit_signal When set to non-zero, the DPC thread will terminate.
+static void dpc_main(io_rdopq_t *opq, chksum_job_t *job_list, size_t job_count, uint32_t volatile *exit_signal)
+{
+    uint32_t const wait = 16;
+    while (*exit_signal == 0)
+    {   //  wait a maximum of 16 milliseconds for an operation to be posted.
+        //  this is necessary because we're using a flag to control termination.
+        if (io_dataq_wait_not_empty(opq, wait))
+        {
+            io_rdop_t rop;
+            if (io_dataq_get(opq, rop))
+            {
+                chksum_job_t  *job = &job_list[rop.Id];
+                uint8_t const *buf = (uint8_t const *)(rop.DataBuffer);
+                size_t  const  amt =  rop.DataAmount;
+                uint8_t const *end = (uint8_t const *)(buf + amt);
+                uint32_t       sum =  0;
+                while  (buf != end)
+                {
+                    sum += *buf++;
+                }
+                job->Checksum += sum;
+                io_return_buffer(rop.ReturnQueue, rop.DataBuffer);
+            }
+        }
+    }
+}
+
+/// @summary Implements the entry point for the I/O processor thread, which 
+/// continuously polls the concurrent read queue to drive I/O operations.
+/// @param rdq The concurrent read queue to poll.
+/// @param exit_signal When set to non-zero, the IOP thread will terminate.
+static void iop_main(io_rdq_t *rdq, uint32_t volatile *exit_signal)
+{
+    uint32_t const wait = 16;
+    while (*exit_signal == 0)
+    {
+        if (io_rdq_wait_io(rdq, wait))
+        {
+            io_rdq_poll(rdq);
+        }
+    }
+}
+
+/// @summary Implements the entry point of the job manager thread. The job 
+/// manager is responsible for creating all of the queues, submitting jobs to
+/// the pending queue, and spawning the job completion monitor.
+/// @param config Configuration parameters for the job manager.
+static void job_main(jobmgr_config_t const &config)
+{
+    // enumerate files in the specified directory:
+    io_file_list_t files;
+    io_create_file_list(&files, 0, 0);
+    io_enumerate_files (&files, config.Path, "*.*", true);
+
+    // create and initialize all of the necessary queues.
+    // choosing the correct size for these queues is important.
+    // the completion queue needs to be large enough to hold all jobs 
+    // in case they all complete at once, which could happen due if 
+    // io_rdq_cancel_all() is called. the rdopq needs to be large 
+    // enough to accomodate the maximum number of buffers in flight 
+    // at any given time (which is workload specific); otherwise, the
+    // system will stall waiting to publish buffers to the DPC thread.
+    size_t        npend = (files.PathCount + 1) / config.MaxConcurrent;
+    io_rdpendq_t *pendq = io_create_jobq(npend);
+    io_rdstopq_t *stopq = io_create_cancelq(10);
+    io_rddoneq_t *doneq = io_create_completionq(files.PathCount + 1);
+    io_rdopq_t   *rdopq = io_create_dataq(config.MaxConcurrent  * 2);
+
+    // now configure and create the concurrent read queue, which performs 
+    // the actual I/O operations and dispatches results to the DPC and JCM.
+    io_rdq_config_t cfg;
+    cfg.DataQueue       = rdopq;
+    cfg.PendingQueue    = pendq;
+    cfg.CancelQueue     = stopq;
+    cfg.CompleteQueue   = doneq;
+    cfg.MaxConcurrent   = config.MaxConcurrent;
+    cfg.MaxBufferSize   = 4 * 1024 * 1024;       // 4MB
+    cfg.MaxReadSize     = config.ReadBufferSize;
+    cfg.Unbuffered      = config.UnbufferedIO;
+    cfg.Asynchronous    = config.AsynchronousIO;
+    io_rdq_t       *rdq = io_create_rdq(cfg);
+    // the buffer size, etc. that we actually got is now specified in cfg.
+    
+    // initialize the per-job state.
+    size_t const  njobs = files.PathCount;
+    chksum_job_t  *jobs = (chksum_job_t*) malloc(njobs * sizeof(chksum_job_t));
+    for (size_t i = 0;  i < njobs; ++i)
+    {
+        jobs[i].Id        = uint32_t(i);
+        jobs[i].Checksum  = 0;
+    }
+
+    // initialize our worker threads.
+    uint64_t          total_nb     = 0;
+    uint32_t volatile exit_signal  = 0;
+    std::thread jcm(jcm_main, doneq, jobs, njobs, &exit_signal, std::ref(total_nb)); // sets exit_signal
+    std::thread dpc(dpc_main, rdopq, jobs, njobs, &exit_signal);           // read exit_signal
+    std::thread iop(iop_main,   rdq, &exit_signal);                        // read exit_signal
+
+    uint64_t beg_time = time_service_read();
+
+    // issue jobs until we run out of work.
+    for (size_t i = 0; i < njobs; /* empty */)
+    {
+        if (io_jobq_wait_not_full(pendq, IO_WAIT_FOREVER))
+        {
+            io_rdq_job_t job;
+            job.JobId       = uint32_t(i);
+            job.Path        = io_file_list_path(&files, i);
+            job.EnqueueTime = 0;   // set by io_rdq_submit()
+            job.RangeCount  = 0;   // read the entire file
+            if (io_rdq_submit(rdq, job) == false)
+            {   // the pending jobs queue is full.
+                continue;
+            }
+            else ++i;
+        }
+    }
+    
+    // wait until the job completion manager exits, and clean up.
+    jcm.join();
+    dpc.join();
+    iop.join();
+
+    uint64_t end_time = time_service_read();
+    uint64_t d = duration(beg_time, end_time);
+    double   s = seconds(d);
+
+    fprintf(config.Output, "test_io_thd: Max Active: %u, Max Read: %u, Unbuffered: %u, AIO: %u.\n", unsigned(cfg.MaxConcurrent), unsigned(cfg.MaxReadSize), unsigned(config.UnbufferedIO ? 1 : 0), unsigned(config.AsynchronousIO ? 1 : 0));
+    fprintf(config.Output, "  Read %8" PRIu64 " bytes in %4.3f seconds (%4.3fMB/sec) (%8.3f bytes/sec).\n", total_nb, s, (total_nb/(1024*1024)) / s, total_nb / s);
+    fprintf(config.Output, "\n");
+
+    free(jobs);
+    io_delete_rdq(rdq);
+    io_delete_completionq(doneq);
+    io_delete_cancelq(stopq);
+    io_delete_dataq(rdopq);
+    io_delete_jobq(pendq);
+    io_delete_file_list(&files);
+}
+
+/// @summary Implements the entry point of the sequential job manager. The job 
+/// manager is responsible for creating all of the queues, submitting jobs to
+/// the pending queue, polling I/O status and scheduling new I/O operations, 
+/// and polling the completion queue for job results.
+/// @param config Configuration parameters for the job manager.
+static void seq_main(jobmgr_config_t const &config)
 {
     io_file_list_t files;
     io_create_file_list(&files, 0, 0);
-    io_enumerate_files (&files, path, "*.*", true);
+    io_enumerate_files (&files, config.Path, "*.*", true);
 
     // create and initialize a concurrent read queue and all supporting queues.
     io_rdpendq_t *jobq    = io_create_jobq(files.PathCount);
@@ -180,11 +380,11 @@ static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t ma
     qconf.PendingQueue    = jobq;
     qconf.CancelQueue     = cancelq;
     qconf.CompleteQueue   = finishq;
-    qconf.MaxConcurrent   = concurrent;
-    qconf.MaxBufferSize   = 16 * 1024 * 1024; // 16MB
-    qconf.MaxReadSize     = max_read;
-    qconf.Unbuffered      = unbuffered;
-    qconf.Asynchronous    = async;
+    qconf.MaxConcurrent   = config.MaxConcurrent;
+    qconf.MaxBufferSize   = 4 * 1024 * 1024; // 4MB
+    qconf.MaxReadSize     = config.ReadBufferSize;
+    qconf.Unbuffered      = config.UnbufferedIO;
+    qconf.Asynchronous    = config.AsynchronousIO;
     io_rdq_t *rdq = io_create_rdq(qconf);
 
     size_t pend_count = files.PathCount;
@@ -192,15 +392,9 @@ static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t ma
     size_t done_count = 0;
     uint32_t max_wait = 16; // in milliseconds
 
-    struct app_job_t
-    {
-        uint32_t Id;
-        uint64_t Checksum;
-    };
-
-    app_job_t *job_list = (app_job_t*) malloc(jobs_count * sizeof(app_job_t));
+    chksum_job_t  *jobs = (chksum_job_t*) malloc(jobs_count * sizeof(chksum_job_t));
     uint64_t   total_nb = 0;
-    uint64_t   begin_tm = time_service_read();
+    uint64_t   beg_time = time_service_read();
 
     while (done_count < jobs_count)
     {
@@ -222,8 +416,8 @@ static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t ma
                 break;
             }
             // initialize our internal state for the job we just submitted.
-            job_list[job.JobId].Id = job.JobId;
-            job_list[job.JobId].Checksum = 0;
+            jobs[job.JobId].Id = job.JobId;
+            jobs[job.JobId].Checksum = 0;
             pend_count--;
         }
 
@@ -237,12 +431,14 @@ static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t ma
         io_rdop_t read;
         while (io_dataq_get(dataq, read))
         {
-            app_job_t &job   = job_list[read.Id];
-            uint8_t   *bytes = (uint8_t*) read.DataBuffer;
+            chksum_job_t &job  = jobs[read.Id];
+            uint8_t    *bytes  = (uint8_t*) read.DataBuffer;
+            uint32_t    chksum = 0;
             for (size_t i = 0; i < read.DataAmount; ++i)
             {
-                job.Checksum += *bytes++;
+                chksum += *bytes++;
             }
+            job.Checksum += chksum;
             io_return_buffer(read.ReturnQueue, read.DataBuffer);
         }
 
@@ -255,16 +451,15 @@ static void test_io_seq(FILE *fp, char const *path, size_t concurrent, size_t ma
         }
     }
 
-    uint64_t end_tm = time_service_read();
-    uint64_t d = duration(begin_tm, end_tm);
-    double sec = seconds(d);
+    uint64_t end_time = time_service_read();
+    uint64_t d = duration(beg_time, end_time);
+    double   s = seconds(d);
 
-    printf("test_io_seq: Max Active: %u, Max Read: %u, Unbuffered: %u, AIO: %u.\n", unsigned(concurrent), unsigned(max_read), unsigned(unbuffered ? 1 : 0), unsigned(async ? 1 : 0));
-    printf("  Read %8" PRIu64 " bytes in %4.3f seconds (%4.3fMB/sec) (%8.3f bytes/sec).\n", total_nb, sec, (total_nb/(1024*1024)) / sec, total_nb / sec);
-    printf("\n");
-    //printf("Total bytes read: %I64u (%I64u MB)\n", total_nb, total_nb / (1024*1024));
+    fprintf(config.Output, "test_io_seq: Max Active: %u, Max Read: %u, Unbuffered: %u, AIO: %u.\n", unsigned(qconf.MaxConcurrent), unsigned(qconf.MaxReadSize), unsigned(config.UnbufferedIO ? 1 : 0), unsigned(config.AsynchronousIO ? 1 : 0));
+    fprintf(config.Output, "  Read %8" PRIu64 " bytes in %4.3f seconds (%4.3fMB/sec) (%8.3f bytes/sec).\n", total_nb, s, (total_nb/(1024*1024)) / s, total_nb / s);
+    fprintf(config.Output, "\n");
     
-    free(job_list);
+    free(jobs);
     io_delete_rdq(rdq);
     io_delete_completionq(finishq);
     io_delete_cancelq(cancelq);
@@ -310,11 +505,22 @@ int main(int argc, char **argv)
     }
     io_delete_file_list(&files);*/
 
+    /*jobmgr_config_t cfg;
+    cfg.Path           = "C:\\foo\\bar";
+    cfg.Output         = stdout;
+    cfg.MaxConcurrent  = 16;
+    cfg.ReadBufferSize = 64 * 1024;
+    cfg.UnbufferedIO   = false;
+    cfg.AsynchronousIO = true;*/
+
     //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, false, false);
     //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, false, true);
     //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, true , true);
     //test_io_seq(stdout, "C:\\Users\\rklenk\\Projects\\vvv", 1, IO_ONE_PAGE, true , false);
-    test_io_seq(stdout, "C:\\WinDDK", 8, 64 * 1024, true, true);
+    //test_io_seq(stdout, "C:\\WinDDK", 8, 64 * 1024, true, true);
+    //seq_main(cfg);
+    //std::thread jmt(job_main, std::ref(cfg));
+    //jmt.join();
 
     time_service_close();
     exit(exit_code);

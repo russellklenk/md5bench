@@ -1,4 +1,4 @@
-CC            = i686-w64-mingw32-gcc
+CC            = x86_64-w64-mingw32-gcc
 TARGET        = md5bench.exe
 LIBRARIES     = -lstdc++ -lm
 HEADERS       = $(wildcard include/*.hpp)
@@ -12,7 +12,7 @@ PLATFORM_DEPS = ${PLATFORM_SRCS:.cpp=.dep}
 INCLUDE_DIRS  = -I. -Iinclude
 LIBRARY_DIRS  = -Llib
 PROJ_WARNINGS = -Wall -Wextra
-PROJ_CCFLAGS  = -std=gnu++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS -D _WIN32 -D _WIN32_WINNT_VISTA -D NDEBUG -D _CONSOLE -D _LIB -D _UNICODE -D UNICODE -D WIN32
+PROJ_CCFLAGS  = -std=gnu++0x -O3 -fstrict-aliasing -D __STDC_FORMAT_MACROS -D _WIN32 -D _WIN64 -D _WIN32_WINNT_VISTA -D NDEBUG -D _CONSOLE -D _LIB -D _UNICODE -D UNICODE -D WIN32 -D WIN64
 PROJ_LDFLAGS  =
 
 .PHONY: all clean distclean output
@@ -31,7 +31,7 @@ ${DEPENDENCIES}: %.dep: %.cpp ${HEADERS} Makefile.w32
 ${PLATFORM_OBJS}: %.o: %.cpp ${PLATFORM_DEPS}
 	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -o $@ -c $<
 
-${PLATFORM_DEPS}: %.dep: %.cpp ${HEADERS} ${PLATFORM_HDRS} Makefile.w32
+${PLATFORM_DEPS}: %.dep: %.cpp ${HEADERS} ${PLATFORM_HDRS} Makefile.w64
 	${CC} ${INCLUDE_DIRS} ${CCFLAGS} ${PROJ_CCFLAGS} -MM $< > $@
 
 output:: ${TARGET}
